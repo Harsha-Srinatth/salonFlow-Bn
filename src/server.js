@@ -21,7 +21,7 @@ import { autoCompleteOverdueStartedBookings } from "./bookings/service.js"
  * - Multi-factor auth (TOTP/WebAuthn) is not implemented here; audit logs and lockouts reduce brute-force risk until MFA is added.
  */
 const app = express()
-const host = process.env.HOST ?? "127.0.0.1"
+const host = process.env.HOST ?? "0.0.0.0"
 const port = Number(process.env.PORT ?? 18081)
 const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5178"
 const configuredOrigins = frontendOrigin
