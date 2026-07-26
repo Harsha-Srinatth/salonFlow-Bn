@@ -34,7 +34,7 @@ import bcrypt from "bcryptjs"
 import { acceptStaffSessionToken, createStaffSession, clearStaffSession } from "../lib/store.js"
 import { signStaffAccessToken, signStaffSetupToken, verifyStaffAccessToken, verifyStaffSetupToken } from "../lib/tokens.js"
 import { verifyFirebaseToken } from "../lib/firebase-admin.js"
-
+const isProduction = process.env.NODE_ENV === "production"
 const router = express.Router()
 let authSchemaEnsured = false
 
@@ -333,11 +333,18 @@ async function handleAppLogin(req, res) {
     role: user.role,
     sessionPolicy: "single_active_cookie",
   })
-  res.cookie("staff_access_token", "", { maxAge: 0, httpOnly: true, secure: false, sameSite: "lax", path: "/" })
+  res.cookie("staff_access_token", "", {
+    maxAge: 0,
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: isProduction ? "none" : "lax",
+    path: "/",
+  })
+  
   res.cookie("app_access_token", accessToken, {
     httpOnly: true,
-    secure: false,
-    sameSite: "lax",
+    secure: isProduction,
+    sameSite: isProduction ? "none" : "lax",
     path: "/",
     maxAge: 7 * 24 * 60 * 60 * 1000,
   })
@@ -394,7 +401,13 @@ async function handleLogout(req, res) {
       // ignore invalid token
     }
   }
-  res.cookie("app_access_token", "", { maxAge: 0, httpOnly: true, secure: false, sameSite: "lax", path: "/" })
+  res.cookie("app_access_token", "", {
+    maxAge: 0,
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: isProduction ? "none" : "lax",
+    path: "/",
+  })
   auditAuthAsync("auth", "logout", { ip: getClientIp(req) })
   return res.json({ success: true })
 }
@@ -458,11 +471,17 @@ async function handleStaffLogin(req, res) {
   const accessToken = await signStaffAccessToken(user.id)
   createStaffSession(user.id, accessToken)
   auditAuthAsync("auth", "staff_login_success", { ip, userId: user.id, role: user.role })
-  res.cookie("app_access_token", "", { maxAge: 0, httpOnly: true, secure: false, sameSite: "lax", path: "/" })
+  res.cookie("app_access_token", "", {
+  maxAge: 0,
+  httpOnly: true,
+  secure: isProduction,
+  sameSite: isProduction ? "none" : "lax",
+  path: "/",
+})
   res.cookie("staff_access_token", accessToken, {
     httpOnly: true,
-    secure: false,
-    sameSite: "lax",
+    secure: isProduction,
+    sameSite: isProduction ? "none" : "lax",
     path: "/",
     maxAge: 7 * 24 * 60 * 60 * 1000,
   })
@@ -484,7 +503,13 @@ async function handleStaffLogout(req, res) {
       // ignore invalid token
     }
   }
-  res.cookie("staff_access_token", "", { maxAge: 0, httpOnly: true, secure: false, sameSite: "lax", path: "/" })
+  res.cookie("staff_access_token", "", {
+  maxAge: 0,
+  httpOnly: true,
+  secure: isProduction,
+  sameSite: isProduction ? "none" : "lax",
+  path: "/",
+})
   auditAuthAsync("auth", "staff_logout", { ip: getClientIp(req) })
   return res.json({ success: true })
 }
