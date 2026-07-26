@@ -1,0 +1,29 @@
+{
+  "name": "sahasra-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "dev:nodemon": "nodemon src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.10.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "drizzle-orm": "^0.45.2",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "firebase-admin": "^12.7.0",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.10.1",
+    "jose": "^5.9.6",
+    "pdfkit": "^0.18.0",
+    "pg": "^8.13.1",
+    "socket.io": "^4.8.3",
+    "uuid": "^11.0.3"
+  }
+}
