@@ -86,6 +86,11 @@ app.use(
       "Content-Type",
       "Authorization",
       "X-Requested-With",
+      // Custom headers used in auth-client.js for session sync
+      "x-signup-role",
+      "x-user-phone",
+      "x-user-name",
+      "x-user-gender",
     ],
   })
 )
