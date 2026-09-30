@@ -20,8 +20,10 @@ export function canTransitionBookingStatus(currentStatus, nextStatus) {
   return (
     (currentStatus === "PENDING" && nextStatus === "CONFIRMED") ||
     (currentStatus === "PENDING" && nextStatus === "CANCELLED") ||
+    (currentStatus === "PENDING" && nextStatus === "NO-SHOW") ||
     (currentStatus === "CONFIRMED" && nextStatus === "STARTED") ||
     (currentStatus === "CONFIRMED" && nextStatus === "CANCELLED") ||
+    (currentStatus === "CONFIRMED" && nextStatus === "NO-SHOW") ||
     (currentStatus === "STARTED" && nextStatus === "COMPLETED")
   )
 }

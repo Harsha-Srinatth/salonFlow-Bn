@@ -6,7 +6,10 @@ import {
   startStylistBookingController,
 } from "../bookings/controller.js"
 import { ensureBookingsSchema } from "../bookings/schema-init.js"
+import { getOperationalQueueBoardController } from "../queue/controller.js"
+import { ensureQueueSchema } from "../queue/schema-init.js"
 import { requireAppRole, requireStaffSessionAuth } from "../middleware/auth.js"
+import { queueLiveRateLimit } from "../middleware/rate-limiters.js"
 import { publishBookingEvent } from "../realtime/socket-gateway.js"
 
 const router = express.Router()
@@ -15,6 +18,7 @@ router.use(requireStaffSessionAuth, requireAppRole("STAFF"))
 router.use(async (_req, _res, next) => {
   try {
     await ensureBookingsSchema()
+    await ensureQueueSchema()
     next()
   } catch (error) {
     next(error)
@@ -22,6 +26,7 @@ router.use(async (_req, _res, next) => {
 })
 
 router.get("/queue", (req, res) => listQueueController(req, res, { publishEvent: publishBookingEvent }))
+router.get("/queue/live", queueLiveRateLimit, getOperationalQueueBoardController)
 router.get("/bookings/:id/invoice.pdf", downloadBookingInvoiceController)
 router.post("/bookings/:id/start", (req, res) => startStylistBookingController(req, res, { publishEvent: publishBookingEvent }))
 router.post("/bookings/:id/complete", (req, res) =>

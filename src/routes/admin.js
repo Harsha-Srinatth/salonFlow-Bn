@@ -17,38 +17,33 @@ import {
 } from "../bookings/controller.js"
 import { ensureBookingsSchema } from "../bookings/schema-init.js"
 import { pool } from "../lib/db-pool.js"
+import { GENDER_UNSPECIFIED, normalizeCustomerGender, parseSelectableGender } from "../lib/gender.js"
+import { isValidFullName } from "../lib/validation.js"
 import { requireAppRole, requireFirebaseAuth } from "../middleware/auth.js"
 import { ensureOfferSchema, createComboOffer, createMembershipDiscount, createServiceDiscount, deleteOfferByType, getOfferCenterData, listOfferCalendarEvents, previewOffers, updateOfferByType, upsertGlobalDiscount } from "../offers/service.js"
 import { ensureMembershipSchema, getAdminMembershipCenter, upsertMembershipPlan } from "../membership/service.js"
+import { ensureFeedbackSchema, getFeedbackSummary, listAdminFeedback, updateFeedbackStatus } from "../feedback/service.js"
+import {
+  approveReferral,
+  deleteAdminRewardCard,
+  ensureLoyaltySchema,
+  getAdminLoyaltyOverview,
+  listAdminRewardCards,
+  rejectReferral,
+  saveAdminRewardCard,
+  saveLoyaltySettings,
+} from "../loyalty/service.js"
+import { getOperationalQueueBoardController } from "../queue/controller.js"
+import { ensureQueueSchema } from "../queue/schema-init.js"
+import { queueLiveRateLimit } from "../middleware/rate-limiters.js"
 import { publishOfferEvent, publishServiceCatalogEvent } from "../realtime/socket-gateway.js"
 import adminBookingRoutes from "./admin-bookings.js"
 
 const router = express.Router()
 const OFFER_SEGMENTS = ["FREE", "BASIC", "PREMIUM"]
 
-function isValidFullName(name) {
-  const normalized = `${name ?? ""}`.trim().replace(/\s+/g, " ")
-  if (normalized.length < 4) return false
-  const tokens = normalized.split(" ")
-  if (tokens.length < 2) return false
-  if (!/^[A-Za-z][A-Za-z\s'.-]+$/.test(normalized)) return false
-  const lettersOnly = normalized.replace(/[^A-Za-z]/g, "").toLowerCase()
-  if (lettersOnly.length < 4) return false
-  let maxRun = 1
-  let run = 1
-  for (let i = 1; i < lettersOnly.length; i += 1) {
-    run = lettersOnly[i] === lettersOnly[i - 1] ? run + 1 : 1
-    if (run > maxRun) maxRun = run
-  }
-  if (maxRun >= 4) return false
-  return new Set(lettersOnly).size > 3
-}
 
-function normalizeGender(gender) {
-  const value = `${gender ?? ""}`.trim().toUpperCase()
-  if (["MALE", "FEMALE", "OTHER"].includes(value)) return value
-  return null
-}
+const normalizeGender = parseSelectableGender
 
 function normalizeStylistGenderType(value) {
   const normalized = `${value ?? ""}`.trim().toUpperCase()
@@ -112,12 +107,156 @@ router.use(async (_req, _res, next) => {
     await ensureBookingsSchema()
     await ensureOfferSchema()
     await ensureMembershipSchema()
+    await ensureFeedbackSchema()
+    await ensureLoyaltySchema()
+    await ensureQueueSchema()
     next()
   } catch (error) {
     next(error)
   }
 })
 router.use("/bookings", adminBookingRoutes)
+router.get("/loyalty", async (_req, res) => {
+  try {
+    const overview = await getAdminLoyaltyOverview()
+    return res.json(overview)
+  } catch (error) {
+    console.error("Failed to load admin loyalty overview", error)
+    return res.status(500).json({ error: "Could not load loyalty overview" })
+  }
+})
+router.patch("/loyalty/settings", async (req, res) => {
+  try {
+    const settings = await saveLoyaltySettings({
+      referrerRewardPoints: req.body?.referrerRewardPoints,
+      referredWelcomePoints: req.body?.referredWelcomePoints,
+      firstBookingDiscountPercent: req.body?.firstBookingDiscountPercent,
+      coolingHours: req.body?.coolingHours,
+      autoApproveMaxRisk: req.body?.autoApproveMaxRisk,
+      autoRejectMinRisk: req.body?.autoRejectMinRisk,
+      velocityMaxReferrals: req.body?.velocityMaxReferrals,
+      velocityWindowHours: req.body?.velocityWindowHours,
+      updatedBy: req.appUser.id,
+    })
+    return res.json({ settings })
+  } catch (error) {
+    if (error?.code === "BAD_REQUEST") return res.status(400).json({ error: error.message })
+    console.error("Failed to save loyalty settings", error)
+    return res.status(500).json({ error: "Internal server error" })
+  }
+})
+router.post("/loyalty/referrals/:id/approve", async (req, res) => {
+  try {
+    const referral = await approveReferral({
+      referralId: `${req.params.id ?? ""}`.trim(),
+      actorUserId: req.appUser.id,
+    })
+    return res.json({ referral })
+  } catch (error) {
+    if (error?.code === "BAD_REQUEST") return res.status(400).json({ error: error.message })
+    console.error("Failed to approve referral", error)
+    return res.status(500).json({ error: "Internal server error" })
+  }
+})
+router.post("/loyalty/referrals/:id/reject", async (req, res) => {
+  try {
+    const referral = await rejectReferral({
+      referralId: `${req.params.id ?? ""}`.trim(),
+      reason: req.body?.reason,
+      actorUserId: req.appUser.id,
+    })
+    return res.json({ referral })
+  } catch (error) {
+    if (error?.code === "BAD_REQUEST") return res.status(400).json({ error: error.message })
+    console.error("Failed to reject referral", error)
+    return res.status(500).json({ error: "Internal server error" })
+  }
+})
+router.get("/loyalty/cards", async (_req, res) => {
+  try {
+    const cards = await listAdminRewardCards()
+    return res.json({ cards })
+  } catch (error) {
+    console.error("Failed to load reward cards", error)
+    return res.status(500).json({ error: "Could not load reward cards" })
+  }
+})
+router.post("/loyalty/cards", async (req, res) => {
+  try {
+    const card = await saveAdminRewardCard({
+      serviceId: req.body?.serviceId,
+      rank: req.body?.rank,
+      probabilityPercent: req.body?.probabilityPercent,
+      isActive: req.body?.isActive,
+      actorUserId: req.appUser.id,
+    })
+    return res.status(201).json({ card })
+  } catch (error) {
+    if (error?.code === "BAD_REQUEST") return res.status(400).json({ error: error.message })
+    console.error("Failed to create reward card", error)
+    return res.status(500).json({ error: "Internal server error" })
+  }
+})
+router.patch("/loyalty/cards/:id", async (req, res) => {
+  try {
+    const card = await saveAdminRewardCard({
+      id: `${req.params.id ?? ""}`.trim(),
+      serviceId: req.body?.serviceId,
+      rank: req.body?.rank,
+      probabilityPercent: req.body?.probabilityPercent,
+      isActive: req.body?.isActive,
+      actorUserId: req.appUser.id,
+    })
+    return res.json({ card })
+  } catch (error) {
+    if (error?.code === "BAD_REQUEST") return res.status(400).json({ error: error.message })
+    console.error("Failed to update reward card", error)
+    return res.status(500).json({ error: "Internal server error" })
+  }
+})
+router.delete("/loyalty/cards/:id", async (req, res) => {
+  try {
+    const deleted = await deleteAdminRewardCard(`${req.params.id ?? ""}`.trim())
+    if (!deleted) return res.status(404).json({ error: "Reward card not found" })
+    return res.json({ deleted: true })
+  } catch (error) {
+    console.error("Failed to delete reward card", error)
+    return res.status(500).json({ error: "Internal server error" })
+  }
+})
+router.get("/feedback", async (req, res) => {
+  try {
+    const [feedback, summary] = await Promise.all([
+      listAdminFeedback({
+        status: req.query.status,
+        type: req.query.type,
+        limit: req.query.limit,
+        offset: req.query.offset,
+      }),
+      getFeedbackSummary(),
+    ])
+    return res.json({ feedback, summary })
+  } catch (error) {
+    console.error("Failed to load admin feedback", error)
+    return res.status(500).json({ error: "Could not load feedback" })
+  }
+})
+router.patch("/feedback/:id", async (req, res) => {
+  try {
+    const feedback = await updateFeedbackStatus({
+      feedbackId: `${req.params.id ?? ""}`.trim(),
+      status: req.body?.status,
+      adminResponse: req.body?.adminResponse,
+      actorUserId: req.appUser.id,
+    })
+    return res.json({ feedback })
+  } catch (error) {
+    if (error?.code === "BAD_REQUEST") return res.status(400).json({ error: error.message })
+    if (error?.code === "NOT_FOUND") return res.status(404).json({ error: error.message })
+    console.error("Failed to update feedback status", error)
+    return res.status(500).json({ error: "Internal server error" })
+  }
+})
 router.get("/services", listAdminServicesController)
 router.post("/services", (req, res) => createAdminServiceController(req, res, { publishServiceEvent: publishServiceCatalogEvent }))
 router.patch("/services/:id", (req, res) => updateAdminServiceController(req, res, { publishServiceEvent: publishServiceCatalogEvent }))
@@ -126,6 +265,7 @@ router.patch("/services/discounts", (req, res) =>
   updateAdminServiceDiscountsController(req, res, { publishServiceEvent: publishServiceCatalogEvent })
 )
 router.get("/queue", listQueueController)
+router.get("/queue/live", queueLiveRateLimit, getOperationalQueueBoardController)
 router.get("/bookings/:id/invoice.pdf", downloadBookingInvoiceController)
 router.get("/payroll/policy", getPayrollPolicyController)
 router.patch("/payroll/policy", updatePayrollPolicyController)
@@ -137,7 +277,9 @@ router.get("/users/gender-pending", async (_req, res) => {
     `
       SELECT id, name, email, phone, role, gender, created_at, updated_at
       FROM users
-      WHERE role = 'USER' AND (gender IS NULL OR gender = 'OTHER')
+      -- 'OTHER' is included on purpose: until signup started requiring an answer
+      -- it was the pre-selected default, so those rows are "never asked" too.
+      WHERE role = 'USER' AND (gender IS NULL OR gender IN ('OTHER', '${GENDER_UNSPECIFIED}'))
       ORDER BY updated_at DESC NULLS LAST, created_at DESC
       LIMIT 500
     `
@@ -148,7 +290,7 @@ router.get("/users/gender-pending", async (_req, res) => {
     email: row.email,
     phone: row.phone,
     role: row.role,
-    gender: row.gender ?? "OTHER",
+    gender: normalizeCustomerGender(row.gender),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }))

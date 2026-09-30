@@ -1,5 +1,6 @@
 import { v4 as uuid } from "uuid"
 import { pool } from "../lib/db-pool.js"
+import { GENDER_UNSPECIFIED, normalizeCustomerGender } from "../lib/gender.js"
 import { decryptPiiText, encryptPiiText } from "../security/crypto-envelope.js"
 import { normalizeBookingStatus } from "./validators.js"
 
@@ -50,6 +51,9 @@ function buildPaymentHistoryMeta(sourceType, amount) {
 function toBookingDto(row) {
   const serviceItems = Array.isArray(row.service_items_json) ? row.service_items_json : []
   const status = normalizeBookingStatus(row.status) ?? "PENDING"
+  // Only present when the query actually joined payment_transactions (BOOKING_PAYMENT_AGG_COLUMNS) —
+  // omit rather than default to 0, so callers can't mistake "not fetched" for "nothing collected".
+  const hasPaymentAgg = row.collected_amount !== undefined
   const collectedAmount = Number(row.collected_amount ?? 0)
   const refundAmount = Number(row.refund_amount ?? 0)
   const retainedAmount = Math.round((collectedAmount - refundAmount) * 100) / 100
@@ -76,6 +80,9 @@ function toBookingDto(row) {
     status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  }
+  if (hasPaymentAgg) {
+    dto.paidAmount = Math.max(0, retainedAmount)
   }
   if (status === "CANCELLED") {
     dto.cancellationFinancials = {
@@ -361,13 +368,19 @@ export async function createBooking({
   return toBookingDto({ ...rows[0], stylist_name: stylistRows[0]?.name ?? null })
 }
 
-export async function findOrCreateWalkinCustomerAccount({ customerName, customerEmail, customerPhone }) {
+export async function findOrCreateWalkinCustomerAccount({
+  customerName,
+  customerEmail,
+  customerPhone,
+  customerGender,
+}) {
   const normalizedEmail = `${customerEmail ?? ""}`.trim().toLowerCase()
   const normalizedPhone = `${customerPhone ?? ""}`.trim()
   const normalizedName = `${customerName ?? ""}`.trim()
+  const normalizedGender = normalizeCustomerGender(customerGender)
   const { rows } = await pool.query(
     `
-      SELECT id, name, email, phone, role, account_status
+      SELECT id, name, email, phone, role, gender, account_status
       FROM users
       WHERE lower(btrim(email)) = lower($1) OR phone = $2
       ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
@@ -389,10 +402,13 @@ export async function findOrCreateWalkinCustomerAccount({ customerName, customer
           name = CASE WHEN $2 <> '' THEN $2 ELSE name END,
           email = CASE WHEN $3 <> '' THEN $3 ELSE email END,
           phone = CASE WHEN $4 <> '' THEN $4 ELSE phone END,
+          -- Reception fills a blank in, but never overrides what the customer
+          -- themselves stated when they registered online.
+          gender = CASE WHEN $5 <> $6 AND gender = $6 THEN $5 ELSE gender END,
           updated_at = NOW()
         WHERE id = $1
       `,
-      [existing.id, normalizedName, normalizedEmail, normalizedPhone]
+      [existing.id, normalizedName, normalizedEmail, normalizedPhone, normalizedGender, GENDER_UNSPECIFIED]
     )
     return {
       id: existing.id,
@@ -406,10 +422,10 @@ export async function findOrCreateWalkinCustomerAccount({ customerName, customer
     inserted = await pool.query(
       `
         INSERT INTO users (id, name, email, phone, role, gender, account_status, latitude, longitude)
-        VALUES ($1, $2, $3, $4, 'USER', 'OTHER', 'PENDING_VERIFICATION', 0, 0)
+        VALUES ($1, $2, $3, $4, 'USER', $5, 'PENDING_VERIFICATION', 0, 0)
         RETURNING id, account_status
       `,
-      [id, normalizedName, normalizedEmail, normalizedPhone]
+      [id, normalizedName, normalizedEmail, normalizedPhone, normalizedGender]
     )
   } catch (error) {
     if (error?.code !== "23505") throw error
@@ -448,7 +464,7 @@ export async function lookupWalkinCustomerByPhoneOrEmail({ customerEmail, custom
   if (!normalizedEmail && !normalizedPhone) return null
   const { rows } = await pool.query(
     `
-      SELECT id, name, email, phone, role, account_status, membership_segment
+      SELECT id, name, email, phone, role, gender, account_status, membership_segment
       FROM users
       WHERE ($1 <> '' AND lower(btrim(email)) = lower($1))
          OR ($2 <> '' AND phone = $2)
@@ -465,6 +481,7 @@ export async function lookupWalkinCustomerByPhoneOrEmail({ customerEmail, custom
     email: row.email,
     phone: row.phone,
     role: row.role,
+    gender: normalizeCustomerGender(row.gender),
     accountStatus: row.account_status,
     membershipSegment: `${row.membership_segment ?? "FREE"}`.trim().toUpperCase() || "FREE",
     isExistingCustomer: row.role === "USER",
@@ -826,6 +843,36 @@ export async function findOverdueStartedBookingsForAutoComplete() {
   return rows
 }
 
+export async function findOverdueUpcomingBookingsForNoShow() {
+  const { rows } = await pool.query(
+    `
+      SELECT id
+      FROM bookings
+      WHERE status IN ('PENDING', 'CONFIRMED')
+        AND (starts_at + (duration_minutes * interval '1 minute')) < NOW()
+    `
+  )
+  return rows
+}
+
+export async function markBookingNoShow({ bookingId }) {
+  const { rows } = await pool.query(
+    `
+      UPDATE bookings
+      SET
+        status = 'NO-SHOW',
+        completed_at = NOW(),
+        updated_at = NOW()
+      WHERE id = $1 AND status IN ('PENDING', 'CONFIRMED')
+      RETURNING id, customer_name, customer_name_enc, customer_email, customer_email_enc, customer_phone, customer_phone_enc, service_name, stylist_id, starts_at, duration_minutes, service_items_json, total_amount, discount_amount, payable_amount, actual_start_at, completed_at, overtime_minutes, penalty_amount, invoice_number, status, created_by, created_at, updated_at
+    `,
+    [bookingId]
+  )
+  if (!rows[0]) return null
+  const { rows: stylistRows } = await pool.query("SELECT name FROM users WHERE id = $1 LIMIT 1", [rows[0].stylist_id])
+  return toBookingDto({ ...rows[0], stylist_name: stylistRows[0]?.name ?? null })
+}
+
 export async function listQueueBookingsForRole({ role, userId, limit = 100 }) {
   const values = [limit]
   let roleWhere = ""
@@ -838,7 +885,8 @@ export async function listQueueBookingsForRole({ role, userId, limit = 100 }) {
       SELECT
         b.id, b.customer_name, b.customer_name_enc, b.customer_email, b.customer_email_enc, b.customer_phone, b.customer_phone_enc,
         b.service_name, b.service_items_json, b.stylist_id, u.name AS stylist_name, b.starts_at, b.duration_minutes,
-        b.total_amount, b.discount_amount, b.payable_amount, b.actual_start_at, b.completed_at, b.overtime_minutes, b.penalty_amount, b.invoice_number, b.status, b.created_by, b.created_at, b.updated_at
+        b.total_amount, b.discount_amount, b.payable_amount, b.actual_start_at, b.completed_at, b.overtime_minutes, b.penalty_amount, b.invoice_number, b.status, b.created_by, b.created_at, b.updated_at,
+        ${BOOKING_PAYMENT_AGG_COLUMNS}
       FROM bookings b
       LEFT JOIN users u ON u.id = b.stylist_id
       WHERE (
@@ -1201,14 +1249,19 @@ export async function getPaymentHistoryById(paymentId) {
   return rows[0] ? toPaymentHistoryDto(rows[0]) : null
 }
 
-export async function ensureStylistProfilesForActiveStaff() {
-  const { rows: stylistRows } = await pool.query(`
+/**
+ * @param {{ query: typeof pool.query }} [db] Connection to run on. Schema bootstrap
+ *   passes its own locked client so the seeding shares that transaction; anything
+ *   else can use the shared pool.
+ */
+export async function ensureStylistProfilesForActiveStaff(db = pool) {
+  const { rows: stylistRows } = await db.query(`
     SELECT id
     FROM users
     WHERE role = 'STAFF' AND account_status = 'ACTIVE'
   `)
   for (const stylist of stylistRows) {
-    await pool.query(
+    await db.query(
       `
         INSERT INTO stylist_profiles (stylist_id, target_segment)
         VALUES ($1, 'UNISEX')
@@ -1219,9 +1272,13 @@ export async function ensureStylistProfilesForActiveStaff() {
   }
 }
 
-/** Removes legacy auto-seeded demo rows (Aarav Kumar / Ishita Reddy) from empty databases. */
-export async function removeLegacyDemoSeedBookings() {
-  const { rows } = await pool.query(
+/**
+ * Removes legacy auto-seeded demo rows (Aarav Kumar / Ishita Reddy) from empty databases.
+ *
+ * @param {{ query: typeof pool.query }} [db] See `ensureStylistProfilesForActiveStaff`.
+ */
+export async function removeLegacyDemoSeedBookings(db = pool) {
+  const { rows } = await db.query(
     `
       SELECT id
       FROM bookings
@@ -1237,7 +1294,7 @@ export async function removeLegacyDemoSeedBookings() {
   )
   const ids = rows.map(row => row.id).filter(Boolean)
   if (!ids.length) return 0
-  await pool.query(`DELETE FROM payment_transactions WHERE booking_id = ANY($1::uuid[])`, [ids])
-  const { rowCount } = await pool.query(`DELETE FROM bookings WHERE id = ANY($1::uuid[])`, [ids])
+  await db.query(`DELETE FROM payment_transactions WHERE booking_id = ANY($1::uuid[])`, [ids])
+  const { rowCount } = await db.query(`DELETE FROM bookings WHERE id = ANY($1::uuid[])`, [ids])
   return rowCount ?? 0
 }

@@ -1,4 +1,5 @@
 import { decryptEnvelope, encryptEnvelope, hasEnvelopeCryptoEnabled } from "../security/crypto-envelope.js"
+import { GENDER_UNSPECIFIED, normalizeCustomerGender, parseSelectableGender } from "../lib/gender.js"
 import { uploadServiceImageDataUri } from "../lib/cloudinary.js"
 import { buildBookingInvoicePdf } from "../billing/invoice.js"
 import { getCustomerMembershipView } from "../membership/service.js"
@@ -37,6 +38,22 @@ import {
 
 function isEncryptedRequest(req) {
   return `${req.headers["x-payload-encrypted"] ?? ""}`.toLowerCase() === "1"
+}
+
+/**
+ * Whose gender should filter the stylist list for this request.
+ *
+ * `req.appUser` is the signed-in caller, which is the customer on the customer
+ * portal but the *receptionist* on the reception portal — filtering walk-in
+ * slots by the receptionist's own gender is meaningless. Staff therefore pass
+ * the walk-in customer's gender explicitly; customers cannot override their own.
+ *
+ * @param {import("express").Request} req
+ */
+function resolveBookingCustomerGender(req) {
+  const isStaffCaller = Boolean(req.appUser?.role) && req.appUser.role !== "USER"
+  if (isStaffCaller) return parseSelectableGender(req.query.customerGender) ?? GENDER_UNSPECIFIED
+  return normalizeCustomerGender(req.appUser?.gender)
 }
 
 function readBody(req) {
@@ -234,7 +251,7 @@ export async function listRecommendedStylistsController(req, res) {
     serviceIds,
     startsAt,
     durationMinutes,
-    customerGender: req.appUser?.gender ?? "OTHER",
+    customerGender: resolveBookingCustomerGender(req),
   })
   return sendPayload(req, res, 200, { stylists: stylists.map(item => ({ id: item.id, name: item.name })) })
 }
@@ -246,7 +263,7 @@ export async function listAvailableSlotsController(req, res) {
     const result = await listAvailableSlots({
       serviceIds,
       date,
-      customerGender: req.appUser?.gender ?? "OTHER",
+      customerGender: resolveBookingCustomerGender(req),
     })
     return sendPayload(req, res, 200, result)
   } catch (error) {
@@ -302,7 +319,7 @@ export async function listQueueController(req, res, { publishEvent } = {}) {
   return sendPayload(req, res, 200, { queue })
 }
 
-export async function updateReceptionBookingController(req, res, { publishEvent }) {
+export async function updateReceptionBookingController(req, res, { publishEvent, publishPaymentEvent }) {
   try {
     const body = readBody(req)
     const booking = await updateReceptionBookingLifecycle({
@@ -310,11 +327,14 @@ export async function updateReceptionBookingController(req, res, { publishEvent 
       payload: body,
       actorUserId: req.appUser.id,
       publishEvent,
+      publishPaymentEvent,
     })
     return sendPayload(req, res, 200, { booking })
   } catch (error) {
     if (error?.code === "BAD_REQUEST") return sendPayload(req, res, 400, { error: error.message })
     if (error?.code === "NOT_FOUND") return sendPayload(req, res, 404, { error: error.message })
+    if (error?.code === "FORBIDDEN") return sendPayload(req, res, 403, { error: error.message })
+    if (error?.code === "INVALID_TRANSITION") return sendPayload(req, res, 409, { error: error.message })
     console.error("Failed to update reception booking", error)
     return sendPayload(req, res, 500, { error: "Internal server error" })
   }

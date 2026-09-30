@@ -1,5 +1,6 @@
 import { v4 as uuid } from "uuid"
 import { pool } from "../lib/db-pool.js"
+import { createSchemaEnsurer } from "../lib/schema-guard.js"
 
 /**
  * Note: `stripe_webhook_events` (Drizzle schema) stores processed Stripe event IDs
@@ -91,36 +92,42 @@ function toPlanDto(row) {
   }
 }
 
-export async function ensureMembershipSchema() {
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS membership_segment VARCHAR(16) NOT NULL DEFAULT 'FREE'`)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS membership_plans (
-      id UUID PRIMARY KEY,
-      segment VARCHAR(16) NOT NULL UNIQUE,
-      name VARCHAR(255) NOT NULL,
-      tagline TEXT,
-      price_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
-      currency VARCHAR(8) NOT NULL DEFAULT 'INR',
-      billing_interval VARCHAR(16) NOT NULL DEFAULT 'month',
-      stripe_price_id VARCHAR(255),
-      benefits_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-      is_active BOOLEAN NOT NULL DEFAULT TRUE,
-      sort_order INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `)
-  for (const plan of DEFAULT_PAID_PLANS) {
-    await pool.query(
-      `
-        INSERT INTO membership_plans (id, segment, name, tagline, price_amount, benefits_json, sort_order)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
-        ON CONFLICT (segment) DO NOTHING
-      `,
-      [uuid(), plan.segment, plan.name, plan.tagline, plan.priceAmount, JSON.stringify(plan.benefits), plan.sortOrder]
-    )
-  }
-}
+export const ensureMembershipSchema = createSchemaEnsurer({
+  name: "membership",
+  async migrate(client) {
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS membership_segment VARCHAR(16) NOT NULL DEFAULT 'FREE'`)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS membership_plans (
+        id UUID PRIMARY KEY,
+        segment VARCHAR(16) NOT NULL UNIQUE,
+        name VARCHAR(255) NOT NULL,
+        tagline TEXT,
+        price_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+        currency VARCHAR(8) NOT NULL DEFAULT 'INR',
+        billing_interval VARCHAR(16) NOT NULL DEFAULT 'month',
+        stripe_price_id VARCHAR(255),
+        benefits_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        sort_order INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `)
+    // Seeded on the same locked connection as the DDL that created the table:
+    // the rows are not visible to other connections until this commits anyway,
+    // and holding the lock means two instances cannot race the seed either.
+    for (const plan of DEFAULT_PAID_PLANS) {
+      await client.query(
+        `
+          INSERT INTO membership_plans (id, segment, name, tagline, price_amount, benefits_json, sort_order)
+          VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+          ON CONFLICT (segment) DO NOTHING
+        `,
+        [uuid(), plan.segment, plan.name, plan.tagline, plan.priceAmount, JSON.stringify(plan.benefits), plan.sortOrder]
+      )
+    }
+  },
+})
 
 export async function listMembershipPlans({ includeInactive = false } = {}) {
   await ensureMembershipSchema()

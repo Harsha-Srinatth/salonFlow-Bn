@@ -1,5 +1,6 @@
 import { v4 as uuid } from "uuid"
 import { pool } from "../lib/db-pool.js"
+import { createSchemaEnsurer } from "../lib/schema-guard.js"
 
 const MEMBERSHIP_SEGMENTS = ["FREE", "BASIC", "PREMIUM"]
 const COMBO_CATEGORIES = ["MEN", "WOMEN", "CHILDREN"]
@@ -37,78 +38,81 @@ async function listServicesMap() {
   return rows
 }
 
-export async function ensureOfferSchema() {
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS membership_segment VARCHAR(16) NOT NULL DEFAULT 'FREE'`)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS offer_global_discounts (
-      id UUID PRIMARY KEY,
-      discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
-      start_at TIMESTAMPTZ,
-      end_at TIMESTAMPTZ,
-      is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS offer_service_discounts (
-      id UUID PRIMARY KEY,
-      service_id UUID NOT NULL REFERENCES service_catalog(id) ON DELETE CASCADE,
-      discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
-      start_at TIMESTAMPTZ,
-      end_at TIMESTAMPTZ,
-      is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `)
-  await pool.query(`CREATE INDEX IF NOT EXISTS offer_service_discounts_service_idx ON offer_service_discounts(service_id)`)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS offer_membership_service_discounts (
-      id UUID PRIMARY KEY,
-      service_id UUID NOT NULL REFERENCES service_catalog(id) ON DELETE CASCADE,
-      membership_segment VARCHAR(16) NOT NULL,
-      discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
-      start_at TIMESTAMPTZ,
-      end_at TIMESTAMPTZ,
-      is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `)
-  await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS offer_membership_service_unique_active_idx
-    ON offer_membership_service_discounts(service_id, membership_segment, start_at, end_at)
-  `)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS offer_combos (
-      id UUID PRIMARY KEY,
-      name VARCHAR(255) NOT NULL,
-      description TEXT,
-      category VARCHAR(16) NOT NULL DEFAULT 'MEN',
-      offer_price NUMERIC(12,2) NOT NULL DEFAULT 0,
-      visible_segments TEXT[] NOT NULL DEFAULT ARRAY['FREE','BASIC','PREMIUM']::text[],
-      start_at TIMESTAMPTZ,
-      end_at TIMESTAMPTZ,
-      is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS offer_combo_services (
-      id UUID PRIMARY KEY,
-      combo_id UUID NOT NULL REFERENCES offer_combos(id) ON DELETE CASCADE,
-      service_id UUID NOT NULL REFERENCES service_catalog(id) ON DELETE CASCADE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE(combo_id, service_id)
-    )
-  `)
-}
+export const ensureOfferSchema = createSchemaEnsurer({
+  name: "offers",
+  async migrate(client) {
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS membership_segment VARCHAR(16) NOT NULL DEFAULT 'FREE'`)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS offer_global_discounts (
+        id UUID PRIMARY KEY,
+        discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+        start_at TIMESTAMPTZ,
+        end_at TIMESTAMPTZ,
+        is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS offer_service_discounts (
+        id UUID PRIMARY KEY,
+        service_id UUID NOT NULL REFERENCES service_catalog(id) ON DELETE CASCADE,
+        discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+        start_at TIMESTAMPTZ,
+        end_at TIMESTAMPTZ,
+        is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `)
+    await client.query(`CREATE INDEX IF NOT EXISTS offer_service_discounts_service_idx ON offer_service_discounts(service_id)`)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS offer_membership_service_discounts (
+        id UUID PRIMARY KEY,
+        service_id UUID NOT NULL REFERENCES service_catalog(id) ON DELETE CASCADE,
+        membership_segment VARCHAR(16) NOT NULL,
+        discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+        start_at TIMESTAMPTZ,
+        end_at TIMESTAMPTZ,
+        is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `)
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS offer_membership_service_unique_active_idx
+      ON offer_membership_service_discounts(service_id, membership_segment, start_at, end_at)
+    `)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS offer_combos (
+        id UUID PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        category VARCHAR(16) NOT NULL DEFAULT 'MEN',
+        offer_price NUMERIC(12,2) NOT NULL DEFAULT 0,
+        visible_segments TEXT[] NOT NULL DEFAULT ARRAY['FREE','BASIC','PREMIUM']::text[],
+        start_at TIMESTAMPTZ,
+        end_at TIMESTAMPTZ,
+        is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS offer_combo_services (
+        id UUID PRIMARY KEY,
+        combo_id UUID NOT NULL REFERENCES offer_combos(id) ON DELETE CASCADE,
+        service_id UUID NOT NULL REFERENCES service_catalog(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(combo_id, service_id)
+      )
+    `)
+  },
+})
 
 export async function getOfferCenterData() {
   const now = new Date()

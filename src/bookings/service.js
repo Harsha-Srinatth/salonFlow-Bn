@@ -1,4 +1,13 @@
 import { auditAuthAsync } from "../lib/audit-log.js"
+import { normalizeCustomerGender, parseSelectableGender } from "../lib/gender.js"
+import { notifyRole, notifyUser } from "../notifications/service.js"
+import {
+  attachRewardVoucherToBooking,
+  claimRewardVoucher,
+  computeFirstBookingDiscount,
+  redeemWalletCredit,
+  rewardReferralIfEligible,
+} from "../loyalty/service.js"
 import { computeBookingOfferPricing, getMembershipSegmentForUser } from "../offers/service.js"
 import {
   computeCancellationRefund,
@@ -35,6 +44,8 @@ import {
   markBookingStarted,
   markBookingCompletedWithPenalty,
   findOverdueStartedBookingsForAutoComplete,
+  findOverdueUpcomingBookingsForNoShow,
+  markBookingNoShow,
   createPaymentTransaction,
   getRevenueSummaryForDate,
   listPaymentTransactions,
@@ -47,6 +58,21 @@ const SALON_CLOSE_MINUTES = 23 * 60
 const LUNCH_START_MINUTES = 13 * 60
 const LUNCH_END_MINUTES = 13 * 60 + 30
 const SLOT_STEP_MINUTES = 15
+const NOTIFY_TIMEZONE = process.env.SALON_TIMEZONE ?? "Asia/Kolkata"
+
+function formatNotifyDateTime(iso) {
+  try {
+    return new Date(iso).toLocaleString("en-IN", {
+      timeZone: NOTIFY_TIMEZONE,
+      day: "numeric",
+      month: "short",
+      hour: "numeric",
+      minute: "2-digit",
+    })
+  } catch {
+    return new Date(iso).toISOString()
+  }
+}
 
 function hhmmToMinutes(value, fallback) {
   const raw = `${value ?? ""}`.trim()
@@ -80,6 +106,8 @@ function roundUpToSlotMinute(totalMinutes, stepMinutes) {
 }
 
 export async function listAdminBookings(query) {
+  await autoCompleteOverdueStartedBookings({})
+  await autoMarkNoShowBookings({})
   const filters = sanitizeBookingFilters(query)
   return listBookings(filters)
 }
@@ -150,6 +178,7 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
   const customerName = `${payload.customerName ?? ""}`.trim()
   const customerEmail = `${payload.customerEmail ?? ""}`.trim().toLowerCase()
   const customerPhone = `${payload.customerPhone ?? ""}`.trim()
+  const customerGender = parseSelectableGender(payload.customerGender)
   const stylistId = `${payload.stylistId ?? ""}`.trim()
   const startsAt = `${payload.startsAt ?? ""}`.trim()
   const serviceIds = Array.isArray(payload.serviceIds)
@@ -160,6 +189,9 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
   if (customerName.length < 2) throw Object.assign(new Error("Customer name is required"), { code: "BAD_REQUEST" })
   if (!isValidEmail(customerEmail)) throw Object.assign(new Error("Valid email is required"), { code: "BAD_REQUEST" })
   if (!isValidPhone(customerPhone)) throw Object.assign(new Error("Valid phone is required"), { code: "BAD_REQUEST" })
+  // A walk-in booking registers a customer account, so it has to ask the same
+  // question signup does — otherwise reception keeps minting genderless accounts.
+  if (!customerGender) throw Object.assign(new Error("Customer gender is required"), { code: "BAD_REQUEST" })
   if (!resolvedServiceIds.length) throw Object.assign(new Error("At least one service is required"), { code: "BAD_REQUEST" })
   if (!stylistId) throw Object.assign(new Error("Stylist is required"), { code: "BAD_REQUEST" })
   if (!startsAt || Number.isNaN(new Date(startsAt).getTime())) throw Object.assign(new Error("Valid slot time is required"), { code: "BAD_REQUEST" })
@@ -172,6 +204,7 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
     customerName,
     customerEmail,
     customerPhone,
+    customerGender,
   })
   const comboId = `${payload.comboId ?? ""}`.trim() || null
   const membershipSegment =
@@ -192,7 +225,7 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
     serviceIds: resolvedServiceIds,
     startsAt: new Date(startsAt).toISOString(),
     durationMinutes,
-    customerGender: "OTHER",
+    customerGender,
   })
   const stylistAllowed = availableStylists.some(stylist => stylist.id === stylistId)
   if (!stylistAllowed) {
@@ -284,13 +317,48 @@ export async function autoCompleteOverdueStartedBookings({ publishEvent } = {}) 
       bookingId: row.id,
       stylistId: row.stylist_id,
     })
+    if (booking.createdBy) {
+      rewardReferralIfEligible({ userId: booking.createdBy }).catch(error =>
+        console.error("reward_referral_auto_complete_failed", error)
+      )
+    }
     if (publishEvent) publishEvent("booking.updated.v1", booking)
   }
   return completed
 }
 
+/**
+ * A booking left in PENDING/CONFIRMED past its scheduled end time means the
+ * customer never showed up and no stylist ever started the service. It is
+ * auto-resolved as NO-SHOW: no refund is computed (unlike cancellation —
+ * the slot was held and never used), and the stylist is simply freed since
+ * nothing was ever assigned to "release".
+ */
+export async function autoMarkNoShowBookings({ publishEvent } = {}) {
+  const overdue = await findOverdueUpcomingBookingsForNoShow()
+  const updated = []
+  for (const row of overdue) {
+    const booking = await markBookingNoShow({ bookingId: row.id })
+    if (!booking) continue
+    updated.push(booking)
+    auditAuthAsync("auth", "booking_marked_no_show", { bookingId: row.id })
+    if (booking.createdBy) {
+      notifyUser({
+        userId: booking.createdBy,
+        type: "BOOKING_NO_SHOW",
+        title: "Missed appointment",
+        body: `Your ${formatNotifyDateTime(booking.startsAt)} ${booking.service} slot passed without a visit. The amount paid is non-refundable.`,
+        data: { bookingId: booking.id },
+      }).catch(error => console.error("notify_booking_no_show_failed", error))
+    }
+    if (publishEvent) publishEvent("booking.updated.v1", booking)
+  }
+  return updated
+}
+
 export async function listCustomerBookings({ customerEmail, customerPhone, limit, offset, publishEvent } = {}) {
   await autoCompleteOverdueStartedBookings({ publishEvent })
+  await autoMarkNoShowBookings({ publishEvent })
   return listBookingsForCustomer({ customerEmail, customerPhone, limit, offset })
 }
 
@@ -514,7 +582,7 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
   const startsAtRaw = `${payload.startsAt ?? ""}`.trim()
   if (!serviceIds.length) throw Object.assign(new Error("At least one service is required"), { code: "BAD_REQUEST" })
   if (!stylistId) throw Object.assign(new Error("Stylist is required"), { code: "BAD_REQUEST" })
-  const customerGender = `${actorUser?.gender ?? "OTHER"}`.trim().toUpperCase()
+  const customerGender = normalizeCustomerGender(actorUser?.gender)
   const membershipSegment = `${actorUser?.membershipSegment ?? "FREE"}`.trim().toUpperCase() || "FREE"
   const startsAt = startsAtRaw ? new Date(startsAtRaw) : new Date(`${bookingDate}T${bookingTime}:00`)
   if (Number.isNaN(startsAt.getTime())) throw Object.assign(new Error("Valid slot time is required"), { code: "BAD_REQUEST" })
@@ -545,6 +613,53 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
     })
   }
 
+  // First-time-customer discount and wallet credit are both applied on top of
+  // offer/membership pricing, then folded into discountAmount so
+  // payableAmount = totalAmount - discountAmount stays true for invoices and
+  // revenue reports. Both are always recomputed by the server from the
+  // customer's actual booking history / wallet balance — never trusted from
+  // the client. Order: offers -> first-booking discount -> wallet credit.
+  let payableAmount = pricing.payableAmount
+  let discountAmount = pricing.discountAmount
+  let firstBookingDiscountAmount = 0
+  const firstBookingDiscount = await computeFirstBookingDiscount({ userId: actorUser.id, payableAmount })
+  if (firstBookingDiscount.discountAmount > 0) {
+    firstBookingDiscountAmount = firstBookingDiscount.discountAmount
+    payableAmount = Math.max(0, payableAmount - firstBookingDiscountAmount)
+    discountAmount += firstBookingDiscountAmount
+  }
+  // A won reward-card voucher makes one specific selected service free.
+  // Claimed atomically UP FRONT (before any discount is applied) so a lost
+  // race against a concurrent claim falls back to "no voucher" instead of
+  // granting the discount without ever actually consuming a voucher.
+  // Not available alongside a combo: combo pricing only returns each item's
+  // standalone price (not its share of the bundle), so "free" would be
+  // computed against the wrong base and over-discount the bundle total.
+  let voucherWinId = null
+  let voucherDiscountAmount = 0
+  const requestedVoucherServiceId = `${payload?.redeemRewardServiceId ?? ""}`.trim()
+  if (!comboId && requestedVoucherServiceId && serviceIds.includes(requestedVoucherServiceId)) {
+    const voucherItem = pricing.serviceItems.find(item => item.id === requestedVoucherServiceId)
+    if (voucherItem) {
+      const claim = await claimRewardVoucher({ userId: actorUser.id, serviceId: requestedVoucherServiceId })
+      if (claim) {
+        const itemFinalPrice = Number(voucherItem.basePrice ?? 0) * (1 - Number(voucherItem.discountPercent ?? 0) / 100)
+        voucherDiscountAmount = Math.max(0, Math.min(payableAmount, Math.round(itemFinalPrice * 100) / 100))
+        voucherWinId = claim.winId
+        payableAmount = Math.max(0, payableAmount - voucherDiscountAmount)
+        discountAmount += voucherDiscountAmount
+      }
+    }
+  }
+  let walletRedeemAmount = 0
+  if (payload?.useWalletCredit && payableAmount > 0) {
+    walletRedeemAmount = await redeemWalletCredit({ userId: actorUser.id, maxAmount: payableAmount })
+    if (walletRedeemAmount > 0) {
+      payableAmount = Math.max(0, payableAmount - walletRedeemAmount)
+      discountAmount += walletRedeemAmount
+    }
+  }
+
   const booking = await createBooking({
     customerName: actorUser.name,
     customerEmail: actorUser.email,
@@ -555,8 +670,8 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
     startsAt: startsAt.toISOString(),
     durationMinutes,
     totalAmount: pricing.totalAmount,
-    discountAmount: pricing.discountAmount,
-    payableAmount: pricing.payableAmount,
+    discountAmount,
+    payableAmount,
     invoiceNumber: `INV-${Date.now()}`,
     status: "CONFIRMED",
     createdBy: actorUser.id,
@@ -565,18 +680,47 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
     customerUserId: actorUser.id,
     bookingId: booking?.id,
     stylistId,
+    walletRedeemAmount,
+    firstBookingDiscountAmount,
+    voucherDiscountAmount,
   })
-  if (booking?.id && pricing.payableAmount > 0) {
+  if (booking?.id && voucherWinId) {
+    attachRewardVoucherToBooking({ winId: voucherWinId, bookingId: booking.id }).catch(error =>
+      console.error("attach_reward_voucher_to_booking_failed", error)
+    )
+  }
+  if (booking?.id && payableAmount > 0) {
     await recordReceptionPayment({
       payload: {
         sourceType: "BOOKING",
         bookingId: booking.id,
         paymentMode: "ONLINE",
-        amount: pricing.payableAmount,
+        amount: payableAmount,
       },
       actorUserId: actorUser.id,
       publishPaymentEvent,
     })
+  }
+  if (booking?.id) {
+    booking.walletRedeemAmount = walletRedeemAmount
+    booking.firstBookingDiscountAmount = firstBookingDiscountAmount
+    booking.voucherDiscountAmount = voucherDiscountAmount
+    notifyUser({
+      userId: actorUser.id,
+      type: "BOOKING_CONFIRMED",
+      title: "Booking confirmed",
+      body: `${booking.service} on ${formatNotifyDateTime(booking.startsAt)} with ${booking.stylistName ?? "your stylist"} is confirmed.`,
+      data: { bookingId: booking.id },
+    }).catch(error => console.error("notify_booking_confirmed_failed", error))
+    if (stylistId) {
+      notifyUser({
+        userId: stylistId,
+        type: "BOOKING_ASSIGNED",
+        title: "New appointment assigned",
+        body: `${booking.service} for ${booking.customer} at ${formatNotifyDateTime(booking.startsAt)}.`,
+        data: { bookingId: booking.id },
+      }).catch(error => console.error("notify_booking_assigned_failed", error))
+    }
   }
   if (booking && publishEvent) publishEvent("booking.updated.v1", booking)
   return booking
@@ -598,6 +742,7 @@ export async function addAdminStylistLeave({ stylistId, leaveStart, leaveEnd, no
 
 export async function listRoleQueue({ role, userId, limit, publishEvent } = {}) {
   await autoCompleteOverdueStartedBookings({ publishEvent })
+  await autoMarkNoShowBookings({ publishEvent })
   return listQueueBookingsForRole({ role, userId, limit })
 }
 
@@ -617,6 +762,11 @@ export async function completeStylistBooking({ bookingId, actorUserId, publishEv
     penaltyPerMinute: policy.penaltyPerMinute,
   })
   if (!booking) throw Object.assign(new Error("Booking not found for stylist"), { code: "NOT_FOUND" })
+  if (booking.createdBy) {
+    rewardReferralIfEligible({ userId: booking.createdBy }).catch(error =>
+      console.error("reward_referral_stylist_complete_failed", error)
+    )
+  }
   if (publishEvent) publishEvent("booking.updated.v1", booking)
   return booking
 }
@@ -669,6 +819,17 @@ export async function recordReceptionPayment({ payload, actorUserId, publishPaym
     if (!bookingId) throw Object.assign(new Error("bookingId is required for booking payment"), { code: "BAD_REQUEST" })
     const booking = await getBookingById(bookingId)
     if (!booking) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
+    // Guards against double-collecting: bookings are already paid in full at creation time
+    // (both online self-service and reception walk-in), so without this check the reception
+    // "Collect payment" panel could record a second payment against an already-settled booking.
+    const alreadyPaid = Number(booking.paidAmount ?? 0)
+    const remainingDue = Math.round((Number(booking.payableAmount ?? 0) - alreadyPaid) * 100) / 100
+    if (amount > remainingDue + 0.01) {
+      throw Object.assign(
+        new Error(`Amount exceeds the remaining balance due (Rs ${Math.max(0, remainingDue).toFixed(2)})`),
+        { code: "BAD_REQUEST" }
+      )
+    }
     resolvedBookingId = booking.id
     resolvedCustomerName = booking.customer
     resolvedCustomerEmail = booking.customerEmail
@@ -724,14 +885,45 @@ export async function getAdminRevenueReport({ month, paymentMode, from, to, limi
   }
 }
 
-export async function updateReceptionBookingLifecycle({ bookingId, payload, actorUserId, publishEvent }) {
+export async function updateReceptionBookingLifecycle({ bookingId, payload, actorUserId, publishEvent, publishPaymentEvent }) {
   const action = `${payload?.action ?? ""}`.trim().toLowerCase()
   if (!bookingId || !action) throw Object.assign(new Error("bookingId and action are required"), { code: "BAD_REQUEST" })
   let updated = null
   if (action === "cancel") {
+    // Reuses the same tiered refund policy as a customer's own cancellation
+    // (100%/50%/0% by time-to-appointment) — every booking here was already
+    // paid in full at creation, so cancelling without this would leave the
+    // collected payment unaccounted for with no refund ever recorded.
+    const current = await getBookingById(bookingId)
+    if (!current) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
+    const currentStatus = normalizeBookingStatus(current.status)
+    if (!canTransitionBookingStatus(currentStatus, "CANCELLED")) {
+      throw Object.assign(new Error("This booking cannot be cancelled"), { code: "INVALID_TRANSITION" })
+    }
+    const refundPreview = computeCancellationRefund({
+      payableAmount: current.payableAmount,
+      startsAt: current.startsAt,
+    })
+    if (!refundPreview.canCancel) {
+      throw Object.assign(new Error(refundPreview.reason ?? "Cannot cancel this booking"), { code: "BAD_REQUEST" })
+    }
     updated = await updateBookingSchedule({ bookingId, status: "CANCELLED", updatedBy: actorUserId })
+    if (refundPreview.refundAmount > 0) {
+      await recordBookingRefund({
+        booking: current,
+        amount: refundPreview.refundAmount,
+        actorUserId,
+        publishPaymentEvent,
+      })
+    }
   } else if (action === "complete") {
-    updated = await updateBookingSchedule({ bookingId, status: "COMPLETED", updatedBy: actorUserId })
+    // Only the assigned stylist can complete service (see completeStylistBooking) —
+    // that path also computes overtime/penalty from the real start time and triggers
+    // referral rewards, none of which a bare status flip here could do correctly.
+    throw Object.assign(
+      new Error("Only the assigned stylist can mark a booking as completed, from their own portal."),
+      { code: "FORBIDDEN" }
+    )
   } else if (action === "assign" || action === "reschedule") {
     const startsAt = payload?.startsAt ? new Date(payload.startsAt).toISOString() : null
     const stylistId = `${payload?.stylistId ?? ""}`.trim() || null
@@ -855,6 +1047,23 @@ export async function cancelCustomerBooking({ bookingId, actorUser, publishEvent
     refundAmount: refundPreview.refundAmount,
     refundPercent: refundPreview.refundPercent,
   })
+  notifyUser({
+    userId: actorUser.id,
+    type: "BOOKING_CANCELLED",
+    title: "Booking cancelled",
+    body:
+      refundPreview.refundAmount > 0
+        ? `Your ${booking.service} booking was cancelled. Rs ${refundPreview.refundAmount.toFixed(2)} (${refundPreview.refundPercent}%) will be refunded.`
+        : `Your ${booking.service} booking was cancelled. No refund applies at this stage.`,
+    data: { bookingId },
+  }).catch(error => console.error("notify_booking_cancelled_failed", error))
+  notifyRole({
+    role: "ADMIN",
+    type: "BOOKING_CANCELLED_ADMIN",
+    title: "Customer cancelled a booking",
+    body: `${booking.customer} cancelled ${booking.service} (${formatNotifyDateTime(booking.startsAt)}).`,
+    data: { bookingId },
+  }).catch(error => console.error("notify_booking_cancelled_admin_failed", error))
   if (publishEvent && updated) publishEvent("booking.updated.v1", updated)
   return {
     id: bookingId,

@@ -1,4 +1,5 @@
 import { pool } from "../lib/db-pool.js"
+import { USER_PROFILE_COLUMNS, toAppUserDto } from "../lib/user-dto.js"
 import { verifyFirebaseToken } from "../lib/firebase-admin.js"
 import { acceptStaffSessionToken } from "../lib/store.js"
 import { verifyStaffAccessToken } from "../lib/tokens.js"
@@ -26,7 +27,7 @@ async function findDbUserByFirebase(firebaseUser) {
     conditions.push(`lower(btrim(email)) = $${values.length}`)
   }
   const sql = `
-    SELECT id, name, email, role, phone, gender, account_status, membership_segment
+    SELECT ${USER_PROFILE_COLUMNS}
     FROM users
     WHERE ${conditions.join(" OR ")}
     ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
@@ -46,7 +47,7 @@ async function findDbUserById(id) {
   if (!id) return null
   const { rows } = await pool.query(
     `
-      SELECT id, name, email, role, phone, gender, account_status, membership_segment
+      SELECT ${USER_PROFILE_COLUMNS}
       FROM users
       WHERE id = $1
       LIMIT 1
@@ -56,24 +57,8 @@ async function findDbUserById(id) {
   return rows[0] ?? null
 }
 
-/**
- * Maps a DB row to the shape exposed on `req.appUser`.
- *
- * @param {object | null} row
- */
-function toAppUser(row) {
-  if (!row) return null
-  return {
-    id: row.id,
-    name: row.name,
-    email: row.email,
-    role: row.role,
-    phone: row.phone,
-    gender: row.gender,
-    accountStatus: row.account_status,
-    membershipSegment: `${row.membership_segment ?? "FREE"}`.trim().toUpperCase() || "FREE",
-  }
-}
+/** Maps a DB row to the shape exposed on `req.appUser`. @see lib/user-dto.js */
+const toAppUser = toAppUserDto
 
 /**
  * Express middleware: authenticate either (1) existing staff/app cookie JWT, or (2) `Authorization: Bearer` Firebase ID token.
@@ -138,6 +123,27 @@ export async function requireFirebaseAuth(req, res, next) {
 }
 
 /**
+ * `/api/auth/session` must always sync from a *fresh* Firebase ID token — never from a stale
+ * app/staff cookie — so `req.firebaseUser` is guaranteed to be set on success. Using
+ * `requireFirebaseAuth` here would silently take the cookie branch and leave `req.firebaseUser`
+ * undefined, crashing the handler.
+ *
+ * @type {import("express").RequestHandler}
+ */
+export async function requireFreshFirebaseToken(req, res, next) {
+  try {
+    const auth = req.headers.authorization ?? ""
+    const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null
+    if (!token) return res.status(401).json({ error: "Missing authorization token" })
+    req.firebaseUser = await verifyFirebaseToken(token)
+    next()
+  } catch (error) {
+    console.error("Firebase auth failed:", error instanceof Error ? error.message : error)
+    res.status(401).json({ error: "Invalid token" })
+  }
+}
+
+/**
  * Factory: requires `req.appUser` or resolved DB user to have a specific `role` (e.g. ADMIN).
  * Must run after `requireFirebaseAuth`.
  *
@@ -149,6 +155,29 @@ export function requireAppRole(role) {
     try {
       const appUser = req.appUser ?? toAppUser(await findDbUserByFirebase(req.firebaseUser))
       if (!appUser || appUser.role !== role) {
+        return res.status(403).json({ error: "Forbidden" })
+      }
+      req.appUser = appUser
+      next()
+    } catch {
+      res.status(403).json({ error: "Forbidden" })
+    }
+  }
+}
+
+/**
+ * Factory: like `requireAppRole`, but accepts any of several roles.
+ * Used by cross-portal routes (e.g. the shared notification center) where
+ * every role — Customer, Receptionist, Stylist, Admin/Owner — is a valid caller.
+ *
+ * @param {string[]} roles
+ * @returns {import("express").RequestHandler}
+ */
+export function requireAnyAppRole(roles) {
+  return async (req, res, next) => {
+    try {
+      const appUser = req.appUser ?? toAppUser(await findDbUserByFirebase(req.firebaseUser))
+      if (!appUser || !roles.includes(appUser.role)) {
         return res.status(403).json({ error: "Forbidden" })
       }
       req.appUser = appUser

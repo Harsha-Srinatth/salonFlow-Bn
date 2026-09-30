@@ -15,8 +15,10 @@ import {
 import { ensureBookingsSchema } from "../bookings/schema-init.js"
 import { ensureMembershipSchema } from "../membership/service.js"
 import { ensureOfferSchema } from "../offers/service.js"
+import { getOperationalQueueBoardController } from "../queue/controller.js"
+import { ensureQueueSchema } from "../queue/schema-init.js"
 import { requireAppRole, requireStaffSessionAuth } from "../middleware/auth.js"
-import { receptionBookingsCreateRateLimit, receptionBookingsListRateLimit } from "../middleware/rate-limiters.js"
+import { queueLiveRateLimit, receptionBookingsCreateRateLimit, receptionBookingsListRateLimit } from "../middleware/rate-limiters.js"
 import { publishBookingEvent } from "../realtime/socket-gateway.js"
 import { publishPaymentEvent } from "../realtime/socket-gateway.js"
 
@@ -28,6 +30,7 @@ router.use(async (_req, _res, next) => {
     await ensureBookingsSchema()
     await ensureOfferSchema()
     await ensureMembershipSchema()
+    await ensureQueueSchema()
     next()
   } catch (error) {
     next(error)
@@ -47,8 +50,9 @@ router.get("/offers", receptionBookingsListRateLimit, listReceptionOffersControl
 router.get("/services", receptionBookingsListRateLimit, listBookableServicesController)
 router.get("/slots", receptionBookingsListRateLimit, listAvailableSlotsController)
 router.get("/queue", receptionBookingsListRateLimit, listQueueController)
+router.get("/queue/live", queueLiveRateLimit, getOperationalQueueBoardController)
 router.patch("/bookings/:id", receptionBookingsCreateRateLimit, (req, res) =>
-  updateReceptionBookingController(req, res, { publishEvent: publishBookingEvent })
+  updateReceptionBookingController(req, res, { publishEvent: publishBookingEvent, publishPaymentEvent })
 )
 router.post("/payments", receptionBookingsCreateRateLimit, (req, res) =>
   createReceptionPaymentController(req, res, { publishPaymentEvent })

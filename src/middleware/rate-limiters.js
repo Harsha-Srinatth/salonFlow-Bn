@@ -56,6 +56,16 @@ export const phoneExistsRateLimit = createLimiter({
 })
 
 /**
+ * Throttles `GET /api/auth/email-exists`, the signup-step duplicate check.
+ * Same intent as `phoneExistsRateLimit` — an unauthenticated yes/no on whether an
+ * address is registered is an enumeration oracle, so it gets its own ceiling.
+ */
+export const emailExistsRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_EMAIL_EXISTS_WINDOW_MS ?? 60 * 60 * 1000),
+  limit: Number(process.env.RATE_EMAIL_EXISTS_MAX ?? 120),
+})
+
+/**
  * Protects `POST /api/auth/complete-db-password-reset` (OOB verification + DB write + Firebase consume).
  */
 export const passwordResetCompleteRateLimit = createLimiter({
@@ -111,4 +121,17 @@ export const receptionBookingsListRateLimit = createLimiter({
 export const receptionBookingsCreateRateLimit = createLimiter({
   windowMs: Number(process.env.RATE_RECEPTION_BOOKINGS_CREATE_WINDOW_MS ?? 60 * 1000),
   limit: Number(process.env.RATE_RECEPTION_BOOKINGS_CREATE_MAX ?? 90),
+})
+
+/**
+ * Guards the live queue endpoints (`/queue/live`, `/queue/me`).
+ *
+ * These are cache-backed and cheap, and clients are expected to hold a websocket
+ * rather than poll — the ceiling is deliberately generous so a genuine burst
+ * (everyone opening the app at once) is served, while a client stuck in a tight
+ * polling loop is still capped instead of multiplying across a million users.
+ */
+export const queueLiveRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_QUEUE_LIVE_WINDOW_MS ?? 60 * 1000),
+  limit: Number(process.env.RATE_QUEUE_LIVE_MAX ?? 240),
 })

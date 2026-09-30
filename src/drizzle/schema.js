@@ -1,4 +1,5 @@
-import { bigint, boolean, doublePrecision, index, integer, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid, varchar, } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { bigint, boolean, check, date, doublePrecision, index, integer, jsonb, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid, varchar, } from "drizzle-orm/pg-core";
 export const userRoleEnum = pgEnum("user_role", [
     "USER",
     "ADMIN",
@@ -34,11 +35,22 @@ export const walletTransactionStatusEnum = pgEnum("wallet_transaction_status", [
     "FAILED",
     "REVERSED",
 ]);
+/**
+ * Customer gender. UNSPECIFIED means nobody asked (legacy rows, walk-ins
+ * created before reception fills it in) and is deliberately distinct from
+ * OTHER, which the customer chose. Kept as a checked varchar rather than a
+ * pgEnum because the live column already exists as VARCHAR(16); the allowed
+ * set is enforced by `users_gender_check` (see auth/schema-init.js).
+ */
+export const GENDER_VALUES = ["MALE", "FEMALE", "OTHER", "UNSPECIFIED"];
 export const users = pgTable("users", {
     id: uuid("id").defaultRandom().primaryKey(),
     name: varchar("name", { length: 255 }).notNull(),
     email: varchar("email", { length: 255 }).notNull().unique(),
     phone: varchar("phone", { length: 20 }).notNull().unique(),
+    gender: varchar("gender", { length: 16 }).notNull().default("UNSPECIFIED"),
+    /** Nullable: "unknown birthday" is a real state. Age is derived, never stored. */
+    dateOfBirth: date("date_of_birth"),
     firebaseUid: varchar("firebase_uid", { length: 255 }).unique(),
     role: userRoleEnum("role").notNull().default("USER"),
     emailVerified: boolean("email_verified").notNull().default(false),
@@ -68,7 +80,12 @@ export const users = pgTable("users", {
     index("users_created_at_idx").on(table.createdAt),
     index("users_referred_by_idx").on(table.referredBy),
     index("users_device_id_idx").on(table.deviceId),
+    index("users_gender_idx").on(table.gender),
     uniqueIndex("users_referral_code_uq").on(table.referralCode),
+    check("users_gender_check", sql`${table.gender} IN ('MALE', 'FEMALE', 'OTHER', 'UNSPECIFIED')`),
+    // Lower bound only — "not in the future" needs CURRENT_DATE, which is not
+    // IMMUTABLE and so cannot appear in a CHECK. App-side validation covers it.
+    check("users_date_of_birth_check", sql`${table.dateOfBirth} IS NULL OR ${table.dateOfBirth} >= DATE '1900-01-01'`),
 ]);
 export const salons = pgTable("salons", {
     id: uuid("id").defaultRandom().primaryKey(),
@@ -167,6 +184,13 @@ export const referrals = pgTable("referrals", {
     rejectedReason: text("rejected_reason"),
     rewardAmount: integer("reward_amount").notNull().default(100),
     rewardGiven: boolean("reward_given").notNull().default(false),
+    /** Welcome credit given to the referred user; the referrer's side is `rewardAmount`. */
+    welcomePoints: integer("welcome_points").notNull().default(0),
+    /** Reward-vault card draw earned by this referral has been used. */
+    cardDrawn: boolean("card_drawn").notNull().default(false),
+    /** Abuse score and the signal keys behind it (see loyalty/referral-risk.js). */
+    riskScore: integer("risk_score").notNull().default(0),
+    riskSignals: jsonb("risk_signals").notNull().default([]),
     ipAddress: varchar("ip_address", { length: 64 }),
     deviceId: varchar("device_id", { length: 255 }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -202,6 +226,8 @@ export const walletTransactions = pgTable("wallet_transactions", {
     status: walletTransactionStatusEnum("status").notNull().default("COMPLETED"),
     amount: bigint("amount", { mode: "number" }).notNull(),
     referralId: uuid("referral_id").references(() => referrals.id, { onDelete: "set null" }),
+    /** Booking a wallet debit was spent on. No FK: `bookings` is not part of this schema. */
+    bookingId: uuid("booking_id"),
     description: text("description"),
     metadata: text("metadata"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
