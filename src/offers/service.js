@@ -1,5 +1,8 @@
 import { v4 as uuid } from "uuid"
 import { pool } from "../lib/db-pool.js"
+import { cachedRead } from "../lib/cache.js"
+import { OFFER_ROWS_CACHE_KEY, invalidateOfferCaches } from "../lib/catalog-cache.js"
+import { roundMoney } from "../lib/money.js"
 import { createSchemaEnsurer } from "../lib/schema-guard.js"
 
 const MEMBERSHIP_SEGMENTS = ["FREE", "BASIC", "PREMIUM"]
@@ -114,23 +117,51 @@ export const ensureOfferSchema = createSchemaEnsurer({
   },
 })
 
+/**
+ * Raw offer tables + the active service list, read together. Cached because every offers
+ * page and every booking price calculation needs it and only an admin edit changes it
+ * (writes below invalidate it). Activity windows (`isActiveNow`) are evaluated per call
+ * from these rows, so an offer still starts and ends on time despite the cache.
+ */
+async function loadOfferRows() {
+  return cachedRead(OFFER_ROWS_CACHE_KEY, {
+    l1TtlMs: 15_000,
+    l2TtlMs: 30_000,
+    async load() {
+      const [services, globalRows, serviceRows, membershipRows, comboRows] = await Promise.all([
+        listServicesMap(),
+        pool.query(`SELECT * FROM offer_global_discounts ORDER BY created_at DESC LIMIT 1`),
+        pool.query(`SELECT * FROM offer_service_discounts ORDER BY updated_at DESC`),
+        pool.query(`SELECT * FROM offer_membership_service_discounts ORDER BY updated_at DESC`),
+        pool.query(`
+          SELECT
+            c.*,
+            COALESCE(array_agg(cs.service_id) FILTER (WHERE cs.service_id IS NOT NULL), '{}') AS service_ids
+          FROM offer_combos c
+          LEFT JOIN offer_combo_services cs ON cs.combo_id = c.id
+          GROUP BY c.id
+          ORDER BY c.updated_at DESC
+        `),
+      ])
+      return {
+        services,
+        globalRow: globalRows.rows[0] ?? null,
+        serviceRows: serviceRows.rows,
+        membershipRows: membershipRows.rows,
+        comboRows: comboRows.rows,
+      }
+    },
+  })
+}
+
 export async function getOfferCenterData() {
   const now = new Date()
-  const [services, globalRows, serviceRows, membershipRows, comboRows] = await Promise.all([
-    listServicesMap(),
-    pool.query(`SELECT * FROM offer_global_discounts ORDER BY created_at DESC LIMIT 1`),
-    pool.query(`SELECT * FROM offer_service_discounts ORDER BY updated_at DESC`),
-    pool.query(`SELECT * FROM offer_membership_service_discounts ORDER BY updated_at DESC`),
-    pool.query(`
-      SELECT
-        c.*,
-        COALESCE(array_agg(cs.service_id) FILTER (WHERE cs.service_id IS NOT NULL), '{}') AS service_ids
-      FROM offer_combos c
-      LEFT JOIN offer_combo_services cs ON cs.combo_id = c.id
-      GROUP BY c.id
-      ORDER BY c.updated_at DESC
-    `),
-  ])
+  const rows = await loadOfferRows()
+  const services = rows.services
+  const globalRows = { rows: rows.globalRow ? [rows.globalRow] : [] }
+  const serviceRows = { rows: rows.serviceRows }
+  const membershipRows = { rows: rows.membershipRows }
+  const comboRows = { rows: rows.comboRows }
   const activeGlobal = globalRows.rows[0] ?? null
   const expiringSoonCount = [...serviceRows.rows, ...membershipRows.rows, ...comboRows.rows]
     .filter(row => isActiveNow(row, now) && row.end_at && new Date(row.end_at).getTime() - now.getTime() <= 3 * 24 * 60 * 60 * 1000)
@@ -196,7 +227,7 @@ export async function getOfferCenterData() {
   }
 }
 
-export async function upsertGlobalDiscount({ payload, actorUserId }) {
+async function upsertGlobalDiscountImpl({ payload, actorUserId }) {
   const discountPercent = toPercent(payload?.discountPercent)
   if (discountPercent === null) throw Object.assign(new Error("Discount must be between 0 and 100"), { code: "BAD_REQUEST" })
   const startAt = toDate(payload?.startAt)
@@ -218,7 +249,7 @@ export async function upsertGlobalDiscount({ payload, actorUserId }) {
   return { warning, center: await getOfferCenterData() }
 }
 
-export async function createServiceDiscount({ payload, actorUserId }) {
+async function createServiceDiscountImpl({ payload, actorUserId }) {
   const serviceId = `${payload?.serviceId ?? ""}`.trim()
   const discountPercent = toPercent(payload?.discountPercent)
   if (!serviceId || discountPercent === null) throw Object.assign(new Error("Service and valid discount are required"), { code: "BAD_REQUEST" })
@@ -259,7 +290,7 @@ export async function createServiceDiscount({ payload, actorUserId }) {
   return getOfferCenterData()
 }
 
-export async function createMembershipDiscount({ payload, actorUserId }) {
+async function createMembershipDiscountImpl({ payload, actorUserId }) {
   const serviceId = `${payload?.serviceId ?? ""}`.trim()
   const segment = normalizeMembershipSegment(payload?.membershipSegment)
   const discountPercent = toPercent(payload?.discountPercent)
@@ -272,7 +303,7 @@ export async function createMembershipDiscount({ payload, actorUserId }) {
   return getOfferCenterData()
 }
 
-export async function createComboOffer({ payload, actorUserId }) {
+async function createComboOfferImpl({ payload, actorUserId }) {
   const name = `${payload?.name ?? ""}`.trim()
   const description = `${payload?.description ?? ""}`.trim()
   const category = `${payload?.category ?? ""}`.trim().toUpperCase()
@@ -323,7 +354,7 @@ export async function listOfferCalendarEvents() {
   }))
 }
 
-export async function deleteOfferByType({ type, id }) {
+async function deleteOfferByTypeImpl({ type, id }) {
   const offerId = `${id ?? ""}`.trim()
   const normalizedType = `${type ?? ""}`.trim().toUpperCase()
   if (!offerId) throw Object.assign(new Error("Offer id is required"), { code: "BAD_REQUEST" })
@@ -344,7 +375,7 @@ export async function deleteOfferByType({ type, id }) {
   return { deleted: Number(result?.rowCount ?? 0) > 0 }
 }
 
-export async function updateOfferByType({ type, id, payload, actorUserId }) {
+async function updateOfferByTypeImpl({ type, id, payload, actorUserId }) {
   const offerId = `${id ?? ""}`.trim()
   const normalizedType = `${type ?? ""}`.trim().toUpperCase()
   if (!offerId) throw Object.assign(new Error("Offer id is required"), { code: "BAD_REQUEST" })
@@ -475,10 +506,9 @@ export async function getMembershipSegmentForUser(userId) {
 
 export async function getCustomerOffersForUser({ membershipSegment }) {
   const segment = normalizeMembershipSegment(membershipSegment) ?? "FREE"
-  const [preview, center] = await Promise.all([
-    previewOffers({ membershipSegment: segment }),
-    getOfferCenterData(),
-  ])
+  // One read of the offer data feeds both views (this used to fetch it twice).
+  const center = await getOfferCenterData()
+  const preview = buildPreview(center, segment)
   const servicesById = new Map(center.services.map(service => [service.id, service]))
 
   const globalDiscount = center.globalDiscount?.isActiveNow
@@ -502,7 +532,7 @@ export async function getCustomerOffersForUser({ membershipSegment }) {
         serviceName: service?.name ?? "Service",
         discountPercent,
         originalPrice,
-        finalPrice: Math.max(0, originalPrice - (originalPrice * discountPercent) / 100),
+        finalPrice: Math.max(0, roundMoney(originalPrice - (originalPrice * discountPercent) / 100)),
         startAt: row.startAt,
         endAt: row.endAt,
       }
@@ -520,7 +550,7 @@ export async function getCustomerOffersForUser({ membershipSegment }) {
         serviceName: service?.name ?? "Service",
         discountPercent,
         originalPrice,
-        finalPrice: Math.max(0, originalPrice - (originalPrice * discountPercent) / 100),
+        finalPrice: Math.max(0, roundMoney(originalPrice - (originalPrice * discountPercent) / 100)),
         startAt: row.startAt,
         endAt: row.endAt,
       }
@@ -574,9 +604,9 @@ export async function computeBookingOfferPricing({ serviceIds, membershipSegment
     const totalAmount = Number(combo.actualPrice ?? 0)
     const payableAmount = Number(combo.offerPrice ?? 0)
     return {
-      totalAmount,
-      discountAmount: Math.max(0, totalAmount - payableAmount),
-      payableAmount,
+      totalAmount: roundMoney(totalAmount),
+      discountAmount: roundMoney(Math.max(0, totalAmount - payableAmount)),
+      payableAmount: roundMoney(payableAmount),
       comboId,
       offerSource: "COMBO_OFFER",
       serviceItems: selectedServices.map(service => ({
@@ -608,9 +638,9 @@ export async function computeBookingOfferPricing({ serviceIds, membershipSegment
   })
 
   return {
-    totalAmount,
-    discountAmount: Math.max(0, totalAmount - payableAmount),
-    payableAmount,
+    totalAmount: roundMoney(totalAmount),
+    discountAmount: roundMoney(Math.max(0, totalAmount - payableAmount)),
+    payableAmount: roundMoney(payableAmount),
     comboId: null,
     offerSource: serviceItems.some(item => item.offerSource !== "NONE") ? "OFFER_APPLIED" : "NONE",
     serviceItems,
@@ -618,9 +648,12 @@ export async function computeBookingOfferPricing({ serviceIds, membershipSegment
 }
 
 export async function previewOffers({ membershipSegment }) {
+  return buildPreview(await getOfferCenterData(), membershipSegment)
+}
+
+function buildPreview(center, membershipSegment) {
   const segment = normalizeMembershipSegment(membershipSegment) ?? "FREE"
   const now = new Date()
-  const center = await getOfferCenterData()
   const servicesById = new Map(center.services.map(service => [service.id, service]))
   const globalDiscount = center.globalDiscount && center.globalDiscount.isActiveNow ? center.globalDiscount.discountPercent : 0
   const serviceDiscountMap = new Map()
@@ -650,7 +683,7 @@ export async function previewOffers({ membershipSegment }) {
       source = "GLOBAL_DISCOUNT"
     }
     const originalPrice = Number(service.basePrice ?? 0)
-    const finalPrice = Math.max(0, originalPrice - (originalPrice * appliedPercent) / 100)
+    const finalPrice = Math.max(0, roundMoney(originalPrice - (originalPrice * appliedPercent) / 100))
     return {
       serviceId: service.id,
       serviceName: service.name,
@@ -676,3 +709,19 @@ export async function previewOffers({ membershipSegment }) {
     })
   return { segment, services, combos: visibleCombos, generatedAt: now.toISOString() }
 }
+
+// Every admin write drops the cached offer rows before returning, so the realtime refresh that
+// follows an edit (and the next customer request) reads fresh data.
+function invalidatingOfferWrite(write) {
+  return async (...args) => {
+    const result = await write(...args)
+    await invalidateOfferCaches()
+    return result
+  }
+}
+export const upsertGlobalDiscount = invalidatingOfferWrite(upsertGlobalDiscountImpl)
+export const createServiceDiscount = invalidatingOfferWrite(createServiceDiscountImpl)
+export const createMembershipDiscount = invalidatingOfferWrite(createMembershipDiscountImpl)
+export const createComboOffer = invalidatingOfferWrite(createComboOfferImpl)
+export const deleteOfferByType = invalidatingOfferWrite(deleteOfferByTypeImpl)
+export const updateOfferByType = invalidatingOfferWrite(updateOfferByTypeImpl)

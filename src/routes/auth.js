@@ -5,7 +5,7 @@
  * staff setup tokens (`STAFF_SETUP_TOKEN_TTL`, default 5m). Multi-factor authentication is not implemented yet.
  */
 import express from "express"
-import { randomBytes } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
 import { pool } from "../lib/db-pool.js"
 import { getClientIp } from "../lib/client-ip.js"
 import { auditAuthAsync } from "../lib/audit-log.js"
@@ -45,7 +45,6 @@ import {
   staffSetPasswordRateLimit,
 } from "../middleware/rate-limiters.js"
 import bcrypt from "bcryptjs"
-import { acceptStaffSessionToken, createStaffSession, clearStaffSession } from "../lib/store.js"
 import { signStaffAccessToken, signStaffSetupToken, verifyStaffAccessToken, verifyStaffSetupToken } from "../lib/tokens.js"
 import { verifyFirebaseToken } from "../lib/firebase-admin.js"
 const isProduction = process.env.NODE_ENV === "production"
@@ -240,14 +239,22 @@ async function handlePostSession(req, res) {
   const requestedDeviceId = typeof req.headers["x-device-id"] === "string" ? req.headers["x-device-id"].trim() : ""
   const firebase = req.firebaseUser
   const verifiedPhone = typeof firebase.phone_number === "string" ? firebase.phone_number.trim() : ""
+  // Identify the account only from facts the signed token proves: its uid, a mailbox
+  // Firebase marked verified, and the phone number it actually delivered an SMS to.
+  // The `x-user-phone` header and an unverified e-mail are whatever the caller typed;
+  // matching on them let anyone with *any* valid Firebase token read — and, below,
+  // attach their own uid to — another customer's account.
   const dbUser = await findDbUser({
     firebaseUid: firebase.uid,
-    email: firebase.email ?? "",
-    phone: verifiedPhone || requestedPhone,
+    email: firebase.email_verified === true ? firebase.email ?? "" : "",
+    phone: verifiedPhone,
   })
 
   if (dbUser && !dbUser.firebase_uid) {
-    await pool.query("UPDATE users SET firebase_uid = $1, updated_at = NOW() WHERE id = $2", [firebase.uid, dbUser.id])
+    await pool.query("UPDATE users SET firebase_uid = $1, updated_at = NOW() WHERE id = $2 AND firebase_uid IS NULL", [
+      firebase.uid,
+      dbUser.id,
+    ])
   }
 
   if (!dbUser) {
@@ -289,7 +296,13 @@ async function handlePostSession(req, res) {
     // which is what forced every new email/password signup through a
     // "forgot password" round trip before their first sign-in.
     const signupPassword = `${req.body?.password ?? ""}`
-    const signupPasswordHash = signupPassword.length >= 6 ? await bcrypt.hash(signupPassword, 12) : null
+    // Same rule as password reset and staff setup. A password that is supplied but too short
+    // used to be dropped silently, leaving an account that could never log in with it.
+    // bcrypt ignores everything past 72 bytes, so longer input is refused rather than truncated.
+    if (signupPassword && (signupPassword.length < 8 || Buffer.byteLength(signupPassword) > 72)) {
+      return res.status(400).json({ error: "Password must be between 8 and 72 characters" })
+    }
+    const signupPasswordHash = signupPassword ? await bcrypt.hash(signupPassword, 12) : null
     // Recorded now, while the token that authorized this signup is in hand. After
     // this request the only trace of *how* they signed up would be a NULL
     // password_hash, which cannot tell a Google customer apart from one whose
@@ -480,7 +493,6 @@ async function handleAppLogin(req, res) {
   }
   clearPasswordLoginFailures(ip, normalizedEmail)
   const accessToken = await signStaffAccessToken(user.id)
-  createStaffSession(user.id, accessToken)
   auditAuthAsync("auth", "login_success", {
     ip,
     userId: user.id,
@@ -527,12 +539,7 @@ async function handleMe(req, res) {
 async function handleLogout(req, res) {
   const token = req.cookies?.app_access_token
   if (token) {
-    try {
-      const payload = await verifyStaffAccessToken(token)
-      clearStaffSession(payload.sub)
-    } catch {
-      // ignore invalid token
-    }
+    // Stateless cookie: clearing it below is the whole logout for customers/admins.
   }
   res.cookie("app_access_token", "", {
     maxAge: 0,
@@ -607,8 +614,10 @@ async function handleStaffLogin(req, res) {
     return res.status(401).json({ error: "Invalid credentials" })
   }
   clearPasswordLoginFailures(ip, normalizedEmail)
-  const accessToken = await signStaffAccessToken(user.id)
-  createStaffSession(user.id, accessToken)
+  // One valid session per staff account: the new id replaces any previous one.
+  const sessionJti = randomUUID()
+  await pool.query("UPDATE users SET staff_session_jti = $2 WHERE id = $1", [user.id, sessionJti])
+  const accessToken = await signStaffAccessToken(user.id, sessionJti)
   auditAuthAsync("auth", "staff_login_success", { ip, userId: user.id, role: user.role })
   res.cookie("app_access_token", "", {
   maxAge: 0,
@@ -637,7 +646,10 @@ async function handleStaffLogout(req, res) {
   if (token) {
     try {
       const payload = await verifyStaffAccessToken(token)
-      clearStaffSession(payload.sub)
+      // Revoke server-side too, so a copied cookie stops working immediately.
+      if (payload.jti) {
+        await pool.query("UPDATE users SET staff_session_jti = NULL WHERE id = $1 AND staff_session_jti = $2", [payload.sub, payload.jti])
+      }
     } catch {
       // ignore invalid token
     }
@@ -663,9 +675,12 @@ async function handleStaffMe(req, res) {
   if (!token) return res.json({ user: null })
   try {
     const payload = await verifyStaffAccessToken(token)
-    if (!acceptStaffSessionToken(payload.sub, token)) return res.json({ user: null })
-    const user = await getDbUserById(payload.sub)
-    if (!user) return res.json({ user: null })
+    const { rows: staffRows } = await pool.query(
+      `SELECT ${USER_PROFILE_COLUMNS}, staff_session_jti FROM users WHERE id = $1 LIMIT 1`,
+      [payload.sub]
+    )
+    const user = staffRows[0]
+    if (!user || !payload.jti || payload.jti !== user.staff_session_jti) return res.json({ user: null })
     return res.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role, accountStatus: user.account_status } })
   } catch {
     return res.json({ user: null })
@@ -760,8 +775,8 @@ async function handleCompleteDbPasswordReset(req, res) {
     const { oobCode, newPassword } = req.body ?? {}
     const code = `${oobCode ?? ""}`.trim()
     if (!code) return res.status(400).json({ error: "Reset code is required" })
-    if (!newPassword || `${newPassword}`.length < 8) {
-      return res.status(400).json({ error: "Password must be at least 8 characters" })
+    if (!newPassword || `${newPassword}`.length < 8 || Buffer.byteLength(`${newPassword}`) > 72) {
+      return res.status(400).json({ error: "Password must be between 8 and 72 characters" })
     }
     const { email } = await verifyPasswordResetOobCode(code)
     const hashedPassword = await bcrypt.hash(`${newPassword}`, 12)
@@ -817,7 +832,9 @@ async function handleStaffSetPassword(req, res) {
     const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : ""
     const { password } = req.body ?? {}
     if (!token) return res.status(400).json({ error: "Missing setup token" })
-    if (!password || `${password}`.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" })
+    if (!password || `${password}`.length < 8 || Buffer.byteLength(`${password}`) > 72) {
+      return res.status(400).json({ error: "Password must be between 8 and 72 characters" })
+    }
     const payload = await verifyStaffSetupToken(token)
     const hashedPassword = await bcrypt.hash(`${password}`, 12)
     const { rowCount } = await pool.query(

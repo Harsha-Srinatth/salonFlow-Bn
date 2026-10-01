@@ -1,5 +1,15 @@
 import { v4 as uuid } from "uuid"
 import { pool } from "../lib/db-pool.js"
+import { cachedRead } from "../lib/cache.js"
+import {
+  CATALOG_ACTIVE_CACHE_KEY,
+  CATALOG_ALL_CACHE_KEY,
+  REVENUE_SUMMARY_CACHE_PREFIX,
+  invalidateCatalogCaches,
+  invalidateRevenueSummary,
+} from "../lib/catalog-cache.js"
+import { SALON_TIMEZONE, SALON_TODAY_START_SQL, SALON_TOMORROW_START_SQL, salonDayStartSql } from "../lib/salon-time.js"
+import { roundMoney } from "../lib/money.js"
 import { GENDER_UNSPECIFIED, normalizeCustomerGender } from "../lib/gender.js"
 import { decryptPiiText, encryptPiiText } from "../security/crypto-envelope.js"
 import { normalizeBookingStatus } from "./validators.js"
@@ -118,8 +128,8 @@ export async function listBookings(filters) {
     where.push(`(customer_name ILIKE $${values.length} OR service_name ILIKE $${values.length})`)
   }
   if (sort === "proximity" && !filters.from && !filters.to) {
-    where.push(`starts_at >= date_trunc('day', NOW())`)
-    where.push(`starts_at < date_trunc('day', NOW()) + interval '1 day'`)
+    where.push(`starts_at >= ${SALON_TODAY_START_SQL}`)
+    where.push(`starts_at < ${SALON_TOMORROW_START_SQL}`)
   }
   let orderBy = "ORDER BY b.starts_at ASC"
   if (sort === "latest") {
@@ -218,7 +228,8 @@ export async function listBookingsForCustomer({ customerEmail, customerPhone, li
         b.updated_at
       FROM bookings b
       LEFT JOIN users u ON u.id = b.stylist_id
-      WHERE lower(b.customer_email) = lower($1) OR b.customer_phone = $2
+      WHERE (lower(b.customer_email) = lower($1) OR b.customer_phone = $2)
+        AND b.hidden_from_customer_at IS NULL
       ORDER BY b.starts_at DESC
       LIMIT $3
       OFFSET $4
@@ -229,7 +240,8 @@ export async function listBookingsForCustomer({ customerEmail, customerPhone, li
     `
       SELECT COUNT(*)::INT AS total
       FROM bookings
-      WHERE lower(customer_email) = lower($1) OR customer_phone = $2
+      WHERE (lower(customer_email) = lower($1) OR customer_phone = $2)
+        AND hidden_from_customer_at IS NULL
     `,
     [customerEmail, customerPhone]
   )
@@ -267,7 +279,10 @@ export async function updateBookingStatus(client, { bookingId, status, updatedBy
     [bookingId, status, updatedBy]
   )
   if (!rows[0]) return null
-  const { rows: stylistRows } = await pool.query("SELECT name FROM users WHERE id = $1 LIMIT 1", [rows[0].stylist_id])
+  // Must use the transaction's own connection: this runs while `client` is checked
+  // out, and asking the pool for a second one deadlocks it once every connection is
+  // held by a transaction waiting for another.
+  const { rows: stylistRows } = await client.query("SELECT name FROM users WHERE id = $1 LIMIT 1", [rows[0].stylist_id])
   return toBookingDto({ ...rows[0], stylist_name: stylistRows[0]?.name ?? null })
 }
 
@@ -289,7 +304,7 @@ export async function withTransaction(run) {
     await client.query("COMMIT")
     return value
   } catch (error) {
-    await client.query("ROLLBACK")
+    await client.query("ROLLBACK").catch(() => {})
     throw error
   } finally {
     client.release()
@@ -297,6 +312,8 @@ export async function withTransaction(run) {
 }
 
 export async function createBooking({
+  id,
+  db = pool,
   customerName,
   customerEmail,
   customerPhone,
@@ -315,7 +332,7 @@ export async function createBooking({
   const encryptedName = encryptPiiText(customerName)
   const encryptedEmail = encryptPiiText(customerEmail)
   const encryptedPhone = encryptPiiText(customerPhone)
-  const { rows } = await pool.query(
+  const { rows } = await db.query(
     `
       INSERT INTO bookings (
         id,
@@ -342,7 +359,7 @@ export async function createBooking({
       RETURNING id, customer_name, customer_name_enc, customer_email, customer_email_enc, customer_phone, customer_phone_enc, service_name, stylist_id, starts_at, duration_minutes, service_items_json, total_amount, discount_amount, payable_amount, actual_start_at, completed_at, overtime_minutes, penalty_amount, invoice_number, status, created_by, created_at, updated_at
     `,
     [
-      uuid(),
+      id ?? uuid(),
       customerName,
       encryptedName,
       customerEmail,
@@ -364,8 +381,18 @@ export async function createBooking({
     ]
   )
   if (!rows[0]) return null
-  const { rows: stylistRows } = await pool.query("SELECT name FROM users WHERE id = $1 LIMIT 1", [rows[0].stylist_id])
+  const { rows: stylistRows } = await db.query("SELECT name FROM users WHERE id = $1 LIMIT 1", [rows[0].stylist_id])
   return toBookingDto({ ...rows[0], stylist_name: stylistRows[0]?.name ?? null })
+}
+
+/**
+ * Serialises booking writes for one stylist for the rest of the current transaction.
+ * Availability is "check, then insert"; without this two concurrent requests both pass
+ * the check and both insert. The lock is transaction-scoped, so it releases on
+ * commit/rollback and a crashed process cannot leave it held.
+ */
+export async function lockStylistSchedule(client, stylistId) {
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 7)::bigint)", [`stylist-schedule:${stylistId}`])
 }
 
 export async function findOrCreateWalkinCustomerAccount({
@@ -378,37 +405,41 @@ export async function findOrCreateWalkinCustomerAccount({
   const normalizedPhone = `${customerPhone ?? ""}`.trim()
   const normalizedName = `${customerName ?? ""}`.trim()
   const normalizedGender = normalizeCustomerGender(customerGender)
-  const { rows } = await pool.query(
+  const reject = message => Object.assign(new Error(message), { code: "BAD_REQUEST" })
+  const { rows: matches } = await pool.query(
     `
       SELECT id, name, email, phone, role, gender, account_status
       FROM users
-      WHERE lower(btrim(email)) = lower($1) OR phone = $2
-      ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-      LIMIT 1
+      WHERE lower(btrim(email)) = $1 OR phone = $2
+      LIMIT 3
     `,
     [normalizedEmail, normalizedPhone]
   )
-  const existing = rows[0] ?? null
+  // The e-mail and the phone must describe the same person. A walk-in form with one field
+  // mistyped used to match on the other and then *overwrite* the real customer's e-mail or
+  // phone with the typo, quietly breaking their login and ownership of their bookings.
+  if (matches.length > 1) {
+    throw reject("This e-mail and phone number belong to two different customers. Please check both.")
+  }
+  const existing = matches[0] ?? null
   if (existing) {
     if (existing.role !== "USER") {
-      const error = new Error("Provided phone/email belongs to staff/admin account")
-      error.code = "BAD_REQUEST"
-      throw error
+      throw reject("Provided phone/email belongs to staff/admin account")
+    }
+    if (`${existing.email ?? ""}`.trim().toLowerCase() !== normalizedEmail || `${existing.phone ?? ""}`.trim() !== normalizedPhone) {
+      throw reject("These details do not match the customer already registered with this phone/e-mail. Look the customer up and use their saved details.")
     }
     await pool.query(
       `
         UPDATE users
         SET
-          name = CASE WHEN $2 <> '' THEN $2 ELSE name END,
-          email = CASE WHEN $3 <> '' THEN $3 ELSE email END,
-          phone = CASE WHEN $4 <> '' THEN $4 ELSE phone END,
           -- Reception fills a blank in, but never overrides what the customer
           -- themselves stated when they registered online.
-          gender = CASE WHEN $5 <> $6 AND gender = $6 THEN $5 ELSE gender END,
+          gender = CASE WHEN $2 <> $3 AND gender = $3 THEN $2 ELSE gender END,
           updated_at = NOW()
         WHERE id = $1
       `,
-      [existing.id, normalizedName, normalizedEmail, normalizedPhone, normalizedGender, GENDER_UNSPECIFIED]
+      [existing.id, normalizedGender, GENDER_UNSPECIFIED]
     )
     return {
       id: existing.id,
@@ -518,6 +549,16 @@ function toServiceDto(row) {
 }
 
 export async function listServiceCatalog({ includeInactive = false } = {}) {
+  // Read on every slot list, booking create and services page, and only changed by an admin
+  // edit (which invalidates it): serve from cache instead of the database each time.
+  return cachedRead(includeInactive ? CATALOG_ALL_CACHE_KEY : CATALOG_ACTIVE_CACHE_KEY, {
+    l1TtlMs: 15_000,
+    l2TtlMs: 60_000,
+    load: () => loadServiceCatalog({ includeInactive }),
+  })
+}
+
+async function loadServiceCatalog({ includeInactive = false } = {}) {
   const { rows } = await pool.query(
     `
       SELECT id, name, category, target_gender, base_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active
@@ -566,6 +607,7 @@ export async function createServiceCatalogItem({
   )
   const service = rows[0]
   if (!service) return null
+  await invalidateCatalogCaches()
   return toServiceDto(service)
 }
 
@@ -614,28 +656,33 @@ export async function updateServiceCatalogItem({
       Boolean(isActive),
     ]
   )
+  if (rows[0]) await invalidateCatalogCaches()
   return rows[0] ? toServiceDto(rows[0]) : null
 }
 
 export async function upsertServiceDiscounts(items) {
-  for (const item of items) {
-    await pool.query(
-      `
-        UPDATE service_catalog
-        SET discount_percent = $2, updated_at = NOW()
-        WHERE id = $1
-      `,
-      [item.id, Number(item.discountPercent ?? 0)]
-    )
-  }
+  // One transaction: a failure part-way used to leave some services discounted and others not.
+  await withTransaction(async client => {
+    for (const item of items) {
+      await client.query(
+        `
+          UPDATE service_catalog
+          SET discount_percent = $2, updated_at = NOW()
+          WHERE id = $1
+        `,
+        [item.id, Number(item.discountPercent ?? 0)]
+      )
+    }
+  })
+  await invalidateCatalogCaches()
 }
 
-export async function findAvailableStylistsForServices({ serviceIds, startsAt, durationMinutes, customerGender }) {
+export async function findAvailableStylistsForServices({ serviceIds, startsAt, durationMinutes, customerGender, db = pool, excludeBookingId = null }) {
   const mins = Number(durationMinutes ?? 45)
   const slotBufferMinutes = Number(process.env.BOOKING_SLOT_BUFFER_MINUTES ?? 0)
   const normalizedGender = `${customerGender ?? "UNSPECIFIED"}`.trim().toUpperCase()
   const allowedSegments = normalizedGender === "FEMALE" ? ["WOMEN_ONLY", "UNISEX"] : normalizedGender === "MALE" ? ["MEN_ONLY", "UNISEX"] : ["UNISEX", "MEN_ONLY", "WOMEN_ONLY"]
-  const { rows } = await pool.query(
+  const { rows } = await db.query(
     `
       WITH requested AS (
         SELECT unnest($1::uuid[]) AS service_id
@@ -663,6 +710,7 @@ export async function findAvailableStylistsForServices({ serviceIds, startsAt, d
             SELECT 1
             FROM bookings b
             WHERE b.stylist_id = m.id
+              AND ($6::uuid IS NULL OR b.id <> $6::uuid)
               AND tstzrange(
                 b.starts_at - make_interval(mins => $4::int),
                 b.starts_at + make_interval(mins => b.duration_minutes + $4::int),
@@ -680,7 +728,7 @@ export async function findAvailableStylistsForServices({ serviceIds, startsAt, d
       FROM available
       ORDER BY matched_count DESC, name ASC
     `,
-    [serviceIds, startsAt, mins, slotBufferMinutes, allowedSegments]
+    [serviceIds, startsAt, mins, slotBufferMinutes, allowedSegments, excludeBookingId]
   )
   return rows
 }
@@ -787,13 +835,17 @@ export async function createStylistLeave({ stylistId, leaveStart, leaveEnd, note
   return rows[0] ?? null
 }
 
-export async function deleteBookingById(bookingId) {
-  const { rowCount } = await pool.query(`DELETE FROM bookings WHERE id = $1`, [bookingId])
+/** Hides a booking from its customer's history without destroying the record. */
+export async function hideBookingFromCustomer(bookingId) {
+  const { rowCount } = await pool.query(
+    `UPDATE bookings SET hidden_from_customer_at = NOW(), updated_at = NOW() WHERE id = $1 AND hidden_from_customer_at IS NULL`,
+    [bookingId]
+  )
   return rowCount > 0
 }
 
-export async function getBookingById(bookingId) {
-  const { rows } = await pool.query(
+export async function getBookingById(bookingId, db = pool) {
+  const { rows } = await db.query(
     `
       SELECT
         b.id, b.customer_name, b.customer_name_enc, b.customer_email, b.customer_email_enc, b.customer_phone, b.customer_phone_enc,
@@ -810,8 +862,8 @@ export async function getBookingById(bookingId) {
   return rows[0] ? toBookingDto(rows[0]) : null
 }
 
-export async function updateBookingSchedule({ bookingId, stylistId, startsAt, durationMinutes, updatedBy, status }) {
-  const { rows } = await pool.query(
+export async function updateBookingSchedule({ bookingId, stylistId, startsAt, durationMinutes, updatedBy, status, db = pool, onlyIfStatusIn = null }) {
+  const { rows } = await db.query(
     `
       UPDATE bookings
       SET
@@ -822,12 +874,13 @@ export async function updateBookingSchedule({ bookingId, stylistId, startsAt, du
         updated_by = $6,
         updated_at = NOW()
       WHERE id = $1
+        AND ($7::text[] IS NULL OR status = ANY($7::text[]))
       RETURNING id, customer_name, customer_name_enc, customer_email, customer_email_enc, customer_phone, customer_phone_enc, service_name, stylist_id, starts_at, duration_minutes, service_items_json, total_amount, discount_amount, payable_amount, invoice_number, status, created_by, created_at, updated_at
     `,
-    [bookingId, stylistId ?? null, startsAt ?? null, durationMinutes ?? null, status ?? null, updatedBy]
+    [bookingId, stylistId ?? null, startsAt ?? null, durationMinutes ?? null, status ?? null, updatedBy, onlyIfStatusIn]
   )
   if (!rows[0]) return null
-  const { rows: stylistRows } = await pool.query("SELECT name FROM users WHERE id = $1 LIMIT 1", [rows[0].stylist_id])
+  const { rows: stylistRows } = await db.query("SELECT name FROM users WHERE id = $1 LIMIT 1", [rows[0].stylist_id])
   return toBookingDto({ ...rows[0], stylist_name: stylistRows[0]?.name ?? null })
 }
 
@@ -837,7 +890,7 @@ export async function findOverdueStartedBookingsForAutoComplete() {
       SELECT id, stylist_id
       FROM bookings
       WHERE status = 'STARTED'
-        AND date_trunc('day', NOW()) > date_trunc('day', COALESCE(actual_start_at, starts_at))
+        AND ${SALON_TODAY_START_SQL} > ${salonDayStartSql("COALESCE(actual_start_at, starts_at)")}
     `
   )
   return rows
@@ -892,8 +945,8 @@ export async function listQueueBookingsForRole({ role, userId, limit = 100 }) {
       WHERE (
         (
           b.status IN ('PENDING', 'CONFIRMED')
-          AND b.starts_at >= date_trunc('day', NOW())
-          AND b.starts_at < date_trunc('day', NOW()) + interval '1 day'
+          AND b.starts_at >= ${SALON_TODAY_START_SQL}
+          AND b.starts_at < ${SALON_TOMORROW_START_SQL}
         )
         OR b.status = 'STARTED'
       )
@@ -915,7 +968,7 @@ export async function markBookingStarted({ bookingId, stylistId, startedAt = new
         actual_start_at = COALESCE(actual_start_at, $3::timestamptz),
         updated_by = $2,
         updated_at = NOW()
-      WHERE id = $1 AND stylist_id = $2
+      WHERE id = $1 AND stylist_id = $2 AND status = 'CONFIRMED'
       RETURNING id, customer_name, customer_name_enc, customer_email, customer_email_enc, customer_phone, customer_phone_enc, service_name, stylist_id, starts_at, duration_minutes, service_items_json, total_amount, discount_amount, payable_amount, actual_start_at, completed_at, overtime_minutes, penalty_amount, invoice_number, status, created_by, created_at, updated_at
     `,
     [bookingId, stylistId, startedAt]
@@ -936,7 +989,7 @@ export async function markBookingCompletedWithPenalty({
     `
       SELECT id, stylist_id, starts_at, actual_start_at, duration_minutes
       FROM bookings
-      WHERE id = $1 AND stylist_id = $2
+      WHERE id = $1 AND stylist_id = $2 AND status = 'STARTED'
       LIMIT 1
     `,
     [bookingId, stylistId]
@@ -961,7 +1014,7 @@ export async function markBookingCompletedWithPenalty({
         penalty_amount = $5,
         updated_by = $2,
         updated_at = NOW()
-      WHERE id = $1 AND stylist_id = $2
+      WHERE id = $1 AND stylist_id = $2 AND status = 'STARTED'
       RETURNING id, customer_name, customer_name_enc, customer_email, customer_email_enc, customer_phone, customer_phone_enc, service_name, stylist_id, starts_at, duration_minutes, service_items_json, total_amount, discount_amount, payable_amount, actual_start_at, completed_at, overtime_minutes, penalty_amount, invoice_number, status, created_by, created_at, updated_at
     `,
     [bookingId, stylistId, completedAt, overtimeMinutes, penaltyAmount]
@@ -1047,8 +1100,9 @@ export async function createPaymentTransaction({
   amount,
   paymentMode,
   collectedBy,
+  db = pool,
 }) {
-  const { rows } = await pool.query(
+  const { rows } = await db.query(
     `
       INSERT INTO payment_transactions (
         id, booking_id, source_type, customer_name, customer_email, customer_phone, amount, payment_mode, collected_by
@@ -1063,11 +1117,12 @@ export async function createPaymentTransaction({
       customerName,
       customerEmail ?? null,
       customerPhone ?? null,
-      Number(amount ?? 0),
+      roundMoney(amount),
       paymentMode,
       collectedBy ?? null,
     ]
   )
+  void invalidateRevenueSummary(SALON_TIMEZONE).catch(() => undefined)
   return rows[0] ?? null
 }
 
@@ -1124,8 +1179,10 @@ export async function listPaymentTransactions({ month, paymentMode, from, to, li
     values.push(paymentMode)
     where.push(`p.payment_mode = $${values.length}`)
   }
-  const safeLimit = Math.min(Math.max(Number(limit ?? 100), 1), 500)
-  const safeOffset = Math.max(Number(offset ?? 0), 0)
+  const limitNumber = Number(limit ?? 100)
+  const offsetNumber = Number(offset ?? 0)
+  const safeLimit = Number.isFinite(limitNumber) ? Math.min(Math.max(Math.trunc(limitNumber), 1), 500) : 100
+  const safeOffset = Number.isFinite(offsetNumber) ? Math.max(Math.trunc(offsetNumber), 0) : 0
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : ""
   const listValues = [...values, safeLimit, safeOffset]
   const { rows } = await pool.query(
@@ -1177,9 +1234,18 @@ export async function listRecentPaymentTransactions(filters) {
   return result.payments
 }
 
-const SALON_TIMEZONE = process.env.SALON_TIMEZONE ?? "Asia/Kolkata"
 
 export async function getRevenueSummaryForDate({ timezone = SALON_TIMEZONE } = {}) {
+  // Aggregates a whole year of payments; a dashboard poll every few seconds does not need a
+  // fresh sum each time. Dropped whenever a payment is written, short TTL as the backstop.
+  return cachedRead(`${REVENUE_SUMMARY_CACHE_PREFIX}${timezone}`, {
+    l1TtlMs: 10_000,
+    l2TtlMs: 15_000,
+    load: () => loadRevenueSummary(timezone),
+  })
+}
+
+async function loadRevenueSummary(timezone) {
   const { rows } = await pool.query(
     `
       WITH local_now AS (
@@ -1207,6 +1273,10 @@ export async function getRevenueSummaryForDate({ timezone = SALON_TIMEZONE } = {
         COALESCE(SUM(CASE WHEN p.collected_at >= b.prev_week_start AND p.collected_at < b.prev_week_end THEN ${PAYMENT_NET_AMOUNT_SQL} ELSE 0 END), 0)::numeric AS prev_week_total
       FROM payment_transactions p
       CROSS JOIN bounds b
+      -- Only the current year and the previous week can contribute to any total, so
+      -- everything older is excluded up front and the collected_at index is used instead
+      -- of summing the entire table on every dashboard load.
+      WHERE p.collected_at >= LEAST(b.year_start, b.prev_week_start)
     `,
     [timezone]
   )
@@ -1221,8 +1291,8 @@ export async function getRevenueSummaryForDate({ timezone = SALON_TIMEZONE } = {
   }
 }
 
-export async function getPaymentHistoryById(paymentId) {
-  const { rows } = await pool.query(
+export async function getPaymentHistoryById(paymentId, db = pool) {
+  const { rows } = await db.query(
     `
       SELECT
         p.id,
@@ -1270,31 +1340,4 @@ export async function ensureStylistProfilesForActiveStaff(db = pool) {
       [stylist.id]
     )
   }
-}
-
-/**
- * Removes legacy auto-seeded demo rows (Aarav Kumar / Ishita Reddy) from empty databases.
- *
- * @param {{ query: typeof pool.query }} [db] See `ensureStylistProfilesForActiveStaff`.
- */
-export async function removeLegacyDemoSeedBookings(db = pool) {
-  const { rows } = await db.query(
-    `
-      SELECT id
-      FROM bookings
-      WHERE created_by IS NULL
-        AND stylist_id IS NULL
-        AND COALESCE(total_amount, 0) = 0
-        AND COALESCE(payable_amount, 0) = 0
-        AND (
-          (customer_name = 'Aarav Kumar' AND service_name = 'Haircut')
-          OR (customer_name = 'Ishita Reddy' AND service_name = 'Hair Color')
-        )
-    `
-  )
-  const ids = rows.map(row => row.id).filter(Boolean)
-  if (!ids.length) return 0
-  await db.query(`DELETE FROM payment_transactions WHERE booking_id = ANY($1::uuid[])`, [ids])
-  const { rowCount } = await db.query(`DELETE FROM bookings WHERE id = ANY($1::uuid[])`, [ids])
-  return rowCount ?? 0
 }

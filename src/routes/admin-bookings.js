@@ -2,7 +2,7 @@ import express from "express"
 import { listBookingsController, updateBookingStatusController } from "../bookings/controller.js"
 import { ensureBookingsSchema } from "../bookings/schema-init.js"
 import { adminBookingsListRateLimit, adminBookingsUpdateRateLimit } from "../middleware/rate-limiters.js"
-import { publishBookingEvent } from "../realtime/socket-gateway.js"
+import { publishBookingEvent, publishPaymentEvent } from "../realtime/socket-gateway.js"
 
 const router = express.Router()
 
@@ -17,7 +17,7 @@ router.use(async (_req, _res, next) => {
 
 router.get("/", adminBookingsListRateLimit, listBookingsController)
 router.patch("/:id/status", adminBookingsUpdateRateLimit, (req, res) =>
-  updateBookingStatusController(req, res, { publishEvent: publishBookingEvent })
+  updateBookingStatusController(req, res, { publishEvent: publishBookingEvent, publishPaymentEvent })
 )
 
 export default router

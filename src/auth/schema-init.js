@@ -150,7 +150,13 @@ export const ensureUserProfileSchema = createSchemaEnsurer({
       END $$;
     `)
     await client.query(`CREATE INDEX IF NOT EXISTS users_gender_idx ON users(gender)`)
+    // Login, password reset and Firebase fallback all look users up by `lower(btrim(email))`,
+    // which the plain `email` indexes cannot serve.
+    await client.query(`CREATE INDEX IF NOT EXISTS users_email_normalized_idx ON users (lower(btrim(email)))`)
 
+    // Id of the one currently valid staff/reception session (see lib/tokens.js). Kept in the
+    // database rather than process memory so it survives restarts and is shared by every instance.
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS staff_session_jti VARCHAR(64)`)
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE`)
     // Lower bound only. "Not in the future" cannot live in a CHECK — CURRENT_DATE
     // is not IMMUTABLE and Postgres rejects it there — so that half is enforced by

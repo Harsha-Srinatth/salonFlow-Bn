@@ -822,11 +822,14 @@ export async function computeFirstBookingDiscount({ userId, payableAmount }) {
 }
 
 /** Atomically debits up to `maxAmount` (capped at the user's balance) and records the ledger entry. Returns the amount actually redeemed. */
-export async function redeemWalletCredit({ userId, maxAmount, bookingId }) {
+export async function redeemWalletCredit({ userId, maxAmount, bookingId, db = null }) {
   const cap = Math.floor(Number(maxAmount) || 0)
   if (!userId || cap <= 0) return 0
   await ensureLoyaltySchema()
-  return withTransaction(async client => {
+  // With `db` the debit joins the caller's transaction (so it rolls back with the
+  // booking it paid for); without it, it is its own atomic unit as before.
+  const run = db ? fn => fn(db) : withTransaction
+  return run(async client => {
     const { rows } = await client.query(`SELECT wallet_balance FROM users WHERE id = $1 FOR UPDATE`, [userId])
     const balance = Number(rows[0]?.wallet_balance ?? 0)
     const redeemAmount = Math.min(balance, cap)
@@ -1186,7 +1189,12 @@ export async function drawRewardCard({ userId, referralId, gender }) {
 
   const winId = uuid()
   await withTransaction(async client => {
-    await client.query(`UPDATE referrals SET card_drawn = TRUE WHERE id = $1`, [referral.id])
+    // Conditional claim: the check above is a read, so two concurrent draws both pass it.
+    // Only the request that flips card_drawn FALSE -> TRUE gets to mint a voucher.
+    const claimed = await client.query(`UPDATE referrals SET card_drawn = TRUE WHERE id = $1 AND card_drawn = FALSE`, [referral.id])
+    if (!claimed.rowCount) {
+      throw Object.assign(new Error("You've already claimed this referral's reward"), { code: "BAD_REQUEST" })
+    }
     await client.query(
       `INSERT INTO referral_reward_wins (id, user_id, referral_id, service_id, status) VALUES ($1,$2,$3,$4,'UNCLAIMED')`,
       [winId, userId, referral.id, picked.service_id]
@@ -1215,10 +1223,10 @@ export async function drawRewardCard({ userId, referralId, gender }) {
  * a row, so a lost race correctly falls back to "no voucher applied"
  * instead of granting the discount without actually consuming anything.
  */
-export async function claimRewardVoucher({ userId, serviceId }) {
+export async function claimRewardVoucher({ userId, serviceId, db = pool }) {
   if (!userId || !serviceId) return null
   await ensureLoyaltySchema()
-  const { rows } = await pool.query(
+  const { rows } = await db.query(
     `
       UPDATE referral_reward_wins
       SET status = 'USED', used_at = NOW()
@@ -1237,8 +1245,8 @@ export async function claimRewardVoucher({ userId, serviceId }) {
 }
 
 /** Best-effort traceability link — the win is already durably marked USED by `claimRewardVoucher`; this just records which booking it paid for. */
-export async function attachRewardVoucherToBooking({ winId, bookingId }) {
+export async function attachRewardVoucherToBooking({ winId, bookingId, db = pool }) {
   if (!winId || !bookingId) return
   await ensureLoyaltySchema()
-  await pool.query(`UPDATE referral_reward_wins SET used_booking_id = $2 WHERE id = $1`, [winId, bookingId])
+  await db.query(`UPDATE referral_reward_wins SET used_booking_id = $2 WHERE id = $1`, [winId, bookingId])
 }

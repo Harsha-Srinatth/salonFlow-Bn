@@ -1,8 +1,18 @@
 import { pool } from "../lib/db-pool.js"
 import { USER_PROFILE_COLUMNS, toAppUserDto } from "../lib/user-dto.js"
 import { verifyFirebaseToken } from "../lib/firebase-admin.js"
-import { acceptStaffSessionToken } from "../lib/store.js"
 import { verifyStaffAccessToken } from "../lib/tokens.js"
+
+/**
+ * True when Firebase *rejected the token* (expired, malformed, revoked). Anything else —
+ * fetching Google's signing keys failed, a timeout, a network error — is our infrastructure
+ * having a bad moment, and answering 401 makes the browser clear the session and send the
+ * user to the login page. Those get 503 so the client just retries.
+ */
+function isTokenRejection(error) {
+  const code = typeof error?.code === "string" ? error.code : ""
+  return code.startsWith("auth/") && code !== "auth/internal-error" && code !== "auth/network-request-failed"
+}
 
 /**
  * Loads app user by Firebase uid or email (whichever is present on the token).
@@ -21,11 +31,17 @@ async function findDbUserByFirebase(firebaseUser) {
     values.push(uid)
     conditions.push(`firebase_uid = $${values.length}`)
   }
-  if (email) {
+  // An e-mail on a Firebase token only identifies someone when Firebase says the mailbox
+  // was actually confirmed. Anyone can create a Firebase e-mail/password account for an
+  // address they do not own and get a perfectly valid, correctly signed ID token for it
+  // (with `email_verified: false`); matching on that address would let them act as
+  // whichever database user — customer, receptionist, admin — owns it.
+  if (email && firebaseUser?.email_verified === true) {
     const e = `${email ?? ""}`.trim().toLowerCase()
     values.push(e)
     conditions.push(`lower(btrim(email)) = $${values.length}`)
   }
+  if (!conditions.length) return null
   const sql = `
     SELECT ${USER_PROFILE_COLUMNS}
     FROM users
@@ -47,7 +63,7 @@ async function findDbUserById(id) {
   if (!id) return null
   const { rows } = await pool.query(
     `
-      SELECT ${USER_PROFILE_COLUMNS}
+      SELECT ${USER_PROFILE_COLUMNS}, staff_session_jti
       FROM users
       WHERE id = $1
       LIMIT 1
@@ -71,11 +87,14 @@ async function resolveAppUserFromSessionCookie(sessionToken, { requireActiveSess
   if (!sessionToken) return null
   try {
     const payload = await verifyStaffAccessToken(sessionToken)
-    if (requireActiveSession) {
-      if (!acceptStaffSessionToken(payload.sub, sessionToken)) return null
-    }
     const user = await findDbUserById(payload.sub)
-    return user ? toAppUser(user) : null
+    if (!user) return null
+    // Staff/reception: only the most recent login is valid, and logout really revokes it.
+    // The session id lives in the database (not process memory), so this holds across
+    // restarts and across several instances. Tokens without an id predate this check and
+    // are refused: those users simply sign in again once.
+    if (requireActiveSession && (!payload.jti || payload.jti !== user.staff_session_jti)) return null
+    return toAppUser(user)
   } catch {
     return null
   }
@@ -118,6 +137,7 @@ export async function requireFirebaseAuth(req, res, next) {
     next()
   } catch (error) {
     console.error("Firebase auth failed:", error instanceof Error ? error.message : error)
+    if (!isTokenRejection(error)) return res.status(503).json({ error: "Authentication service unavailable" })
     res.status(401).json({ error: "Invalid token" })
   }
 }
@@ -139,6 +159,7 @@ export async function requireFreshFirebaseToken(req, res, next) {
     next()
   } catch (error) {
     console.error("Firebase auth failed:", error instanceof Error ? error.message : error)
+    if (!isTokenRejection(error)) return res.status(503).json({ error: "Authentication service unavailable" })
     res.status(401).json({ error: "Invalid token" })
   }
 }

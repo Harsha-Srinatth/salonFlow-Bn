@@ -81,6 +81,23 @@ export async function notifyRole({ role, type, title, body, data, excludeUserId 
   return notifications
 }
 
+/**
+ * Retention: read notifications older than `readDays` and anything older than `maxDays` are
+ * removed, so the table stays proportional to recent activity instead of growing forever.
+ */
+export async function pruneOldNotifications({ readDays = 90, maxDays = 365 } = {}) {
+  await ensureNotificationsSchema()
+  const { rowCount } = await pool.query(
+    `
+      DELETE FROM notifications
+      WHERE created_at < NOW() - ($2::int * interval '1 day')
+         OR (read_at IS NOT NULL AND created_at < NOW() - ($1::int * interval '1 day'))
+    `,
+    [readDays, maxDays]
+  )
+  return rowCount
+}
+
 export async function listNotifications({ userId, limit = 30, offset = 0, unreadOnly = false }) {
   await ensureNotificationsSchema()
   const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 100)

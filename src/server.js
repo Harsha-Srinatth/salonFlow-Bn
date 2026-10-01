@@ -5,13 +5,16 @@ import express from "express"
 import helmet from "helmet"
 import { createServer } from "node:http"
 
+import { tryAcquireSlot } from "./lib/redis.js"
+import { assertProductionEnv } from "./lib/env-check.js"
+import "./lib/async-routes.js"
+import { pool } from "./lib/db-pool.js"
 import { attachRequestId } from "./middleware/request-id.js"
 
 import adminRoutes from "./routes/admin.js"
 import authRoutes from "./routes/auth.js"
 import customerRoutes from "./routes/customer.js"
 import notificationRoutes from "./routes/notifications.js"
-import publicRoutes from "./routes/public.js"
 import receptionRoutes from "./routes/reception.js"
 import staffRoutes from "./routes/staff.js"
 
@@ -32,6 +35,11 @@ import { ensureQueueSchema } from "./queue/schema-init.js"
 import { ensureUserProfileSchema } from "./auth/schema-init.js"
 import { broadcastQueueSnapshot, runQueueReminderSweep } from "./queue/service.js"
 import { ensureLoyaltySchema, runReferralSettlementSweep } from "./loyalty/service.js"
+
+assertProductionEnv()
+
+let shuttingDown = false
+const BOOKING_SWEEP_SLOT_KEY = "sahasra:bookings:sweep-slot"
 
 const app = express()
 
@@ -88,7 +96,7 @@ app.use(
       }
 
       console.log("Blocked Origin:", origin)
-      return callback(new Error(`CORS blocked for origin: ${origin}`))
+      return callback(Object.assign(new Error(`CORS blocked for origin: ${origin}`), { status: 403 }))
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -107,7 +115,10 @@ app.use(
   })
 )
 
-app.use(express.json())
+// Service photos arrive as base64 inside JSON (the route allows 8 MB of image, ~11 MB encoded);
+// everything else keeps a small cap so a large body cannot be used to burn memory.
+app.use("/api/admin/services/upload-image", express.json({ limit: "12mb" }))
+app.use(express.json({ limit: "256kb" }))
 app.use(cookieParser())
 app.use(attachRequestId)
 
@@ -118,29 +129,76 @@ app.get("/health", (_req, res) => {
   })
 })
 
+// Readiness: unlike /health (process is alive) this proves the database answers, so a
+// load balancer can stop routing to an instance whose pool is wedged or whose DB is gone.
+app.get("/ready", async (_req, res) => {
+  if (shuttingDown) return res.status(503).json({ ok: false, error: "shutting_down" })
+  try {
+    await Promise.race([
+      pool.query("SELECT 1"),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("db_timeout")), 3000)),
+    ])
+    res.status(200).json({ ok: true })
+  } catch (error) {
+    res.status(503).json({ ok: false, error: "database_unavailable" })
+  }
+})
+
 app.use("/api/auth", authRoutes)
 app.use("/api/admin", adminRoutes)
 app.use("/api/customer", customerRoutes)
 app.use("/api/reception", receptionRoutes)
 app.use("/api/staff", staffRoutes)
 app.use("/api/notifications", notificationRoutes)
-app.use("/api", publicRoutes)
 
-app.use((err, req, res, _next) => {
-  console.error("request_failed", {
-    requestId: req.requestId,
-    error: err instanceof Error ? err.message : err,
-  })
+// Postgres errors that mean "the client sent something malformed" rather than
+// "the server broke": invalid uuid/number/timestamp text, out-of-range values.
+const CLIENT_INPUT_PG_CODES = new Set(["22P02", "22007", "22008", "22003", "22001", "23514"])
 
-  res.status(500).json({
-    error: "Internal server error",
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err)
+
+  let status = Number(err?.status ?? err?.statusCode)
+  if (!(status >= 400 && status < 600)) {
+    // 23505 = unique violation (duplicate e-mail/phone/etc.): the client's conflict, not a crash.
+    status = err?.code === "23505" ? 409 : CLIENT_INPUT_PG_CODES.has(err?.code) ? 400 : 500
+  }
+
+  if (status >= 500) {
+    console.error("request_failed", {
+      requestId: req.requestId,
+      method: req.method,
+      path: req.path,
+      error: err instanceof Error ? err.stack ?? err.message : err,
+    })
+  }
+
+  const messages = {
+    400: "Invalid request",
+    403: "Forbidden",
+    409: "That already exists",
+    413: "Request body too large",
+  }
+  res.status(status).json({
+    error: status >= 500 ? "Internal server error" : messages[status] ?? "Request failed",
     requestId: req.requestId,
   })
 })
 
+// Last line of defence: log and keep serving. A rejected promise outside a request
+// (a background sweep, a fire-and-forget notification) must not take the API down.
+process.on("unhandledRejection", reason => {
+  console.error("unhandled_rejection", reason instanceof Error ? reason.stack ?? reason.message : reason)
+})
+process.on("uncaughtException", error => {
+  console.error("uncaught_exception", error instanceof Error ? error.stack ?? error.message : error)
+  // State may be inconsistent after a synchronous throw: exit and let the supervisor restart.
+  setTimeout(() => process.exit(1), 100).unref()
+})
+
 const httpServer = createServer(app)
 
-await initSocketGateway(httpServer, {
+const io = await initSocketGateway(httpServer, {
   corsOrigin(origin, callback) {
     if (!origin) {
       return callback(null, true)
@@ -158,38 +216,60 @@ httpServer.listen(port, host, () => {
   console.log(`Backend listening on http://${host}:${port}`)
 })
 
+// Orchestrators stop a container with SIGTERM and kill it after a grace period. Finish what is
+// in flight (HTTP, sockets), release database connections, then exit, instead of dropping
+// requests and leaving transactions to time out on the database side.
+async function shutdown(signal) {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log("shutdown_start", { signal })
+  setTimeout(() => process.exit(1), Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 10_000)).unref()
+  try {
+    await new Promise(resolve => io.close(resolve)) // also closes the underlying HTTP server
+    await pool.end()
+    console.log("shutdown_complete")
+    process.exit(0)
+  } catch (error) {
+    console.error("shutdown_failed", error)
+    process.exit(1)
+  }
+}
+process.on("SIGTERM", () => void shutdown("SIGTERM"))
+process.on("SIGINT", () => void shutdown("SIGINT"))
+
 const autoCompleteIntervalMs = Number(
   process.env.BOOKING_AUTO_COMPLETE_INTERVAL_MS ?? 60000
 )
 
-setInterval(async () => {
-  try {
-    await autoCompleteOverdueStartedBookings({
-      publishEvent: publishBookingEvent,
-    })
-  } catch (error) {
-    console.error("booking_auto_complete_failed", error)
-  }
-  try {
-    await autoMarkNoShowBookings({
-      publishEvent: publishBookingEvent,
-    })
-  } catch (error) {
-    console.error("booking_auto_no_show_failed", error)
-  }
-}, autoCompleteIntervalMs)
+// These two sweeps used to run inside every booking-list request as well, which put
+// writes and extra table scans on every read path. They now run only here, and are
+// guarded twice: `running` stops a slow tick overlapping the next one in this process,
+// and the Redis slot makes one instance per interval do the work fleet-wide (without
+// Redis there is a single process by definition, so the slot is always granted).
+let bookingSweepRunning = false
 
-void autoCompleteOverdueStartedBookings({
-  publishEvent: publishBookingEvent,
-}).catch((error) => {
-  console.error("booking_auto_complete_startup_failed", error)
-})
+async function runBookingSweeps(label) {
+  if (bookingSweepRunning) return
+  bookingSweepRunning = true
+  try {
+    if (!(await tryAcquireSlot(BOOKING_SWEEP_SLOT_KEY, Math.max(1000, Math.round(autoCompleteIntervalMs * 0.9))))) return
+    try {
+      await autoCompleteOverdueStartedBookings({ publishEvent: publishBookingEvent })
+    } catch (error) {
+      console.error(`booking_auto_complete_${label}_failed`, error)
+    }
+    try {
+      await autoMarkNoShowBookings({ publishEvent: publishBookingEvent })
+    } catch (error) {
+      console.error(`booking_auto_no_show_${label}_failed`, error)
+    }
+  } finally {
+    bookingSweepRunning = false
+  }
+}
 
-void autoMarkNoShowBookings({
-  publishEvent: publishBookingEvent,
-}).catch((error) => {
-  console.error("booking_auto_no_show_startup_failed", error)
-})
+setInterval(() => void runBookingSweeps("tick"), autoCompleteIntervalMs)
+void runBookingSweeps("startup")
 
 // Live queue (SRS 4.7). Both workers are safe to run on every instance: the
 // broadcaster holds a fleet-wide Redis slot so only one copy of each snapshot is

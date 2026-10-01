@@ -52,6 +52,15 @@ function normalizeStylistGenderType(value) {
   return null
 }
 
+const STAFF_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+// Staff onboard by confirming an SMS to this number, and the server matches it against
+// Firebase's E.164 claim exactly, so anything that is not E.164 can never complete onboarding.
+const STAFF_PHONE_PATTERN = /^\+[1-9]\d{7,14}$/
+
+function normalizeStaffEmail(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : ""
+}
+
 function normalizeAllowedServiceIds(value) {
   const list = Array.isArray(value) ? value : []
   const ids = list.map(item => `${item ?? ""}`.trim().toLowerCase()).filter(Boolean)
@@ -259,11 +268,12 @@ router.patch("/feedback/:id", async (req, res) => {
 })
 router.get("/services", listAdminServicesController)
 router.post("/services", (req, res) => createAdminServiceController(req, res, { publishServiceEvent: publishServiceCatalogEvent }))
-router.patch("/services/:id", (req, res) => updateAdminServiceController(req, res, { publishServiceEvent: publishServiceCatalogEvent }))
-router.post("/services/upload-image", uploadAdminServiceImageController)
+// Static segment first: `/services/:id` would otherwise swallow `/services/discounts`.
 router.patch("/services/discounts", (req, res) =>
   updateAdminServiceDiscountsController(req, res, { publishServiceEvent: publishServiceCatalogEvent })
 )
+router.patch("/services/:id", (req, res) => updateAdminServiceController(req, res, { publishServiceEvent: publishServiceCatalogEvent }))
+router.post("/services/upload-image", uploadAdminServiceImageController)
 router.get("/queue", listQueueController)
 router.get("/queue/live", queueLiveRateLimit, getOperationalQueueBoardController)
 router.get("/bookings/:id/invoice.pdf", downloadBookingInvoiceController)
@@ -367,7 +377,9 @@ router.get("/staff", async (_req, res) => {
 })
 
 router.post("/staff", async (req, res) => {
-  const { name, email, phone, role } = req.body ?? {}
+  const { name, role } = req.body ?? {}
+  const email = normalizeStaffEmail(req.body?.email)
+  const phone = typeof req.body?.phone === "string" ? req.body.phone.trim() : ""
   const genderType = normalizeStylistGenderType(req.body?.genderType) ?? "UNISEX"
   const allowedServiceIds = normalizeAllowedServiceIds(req.body?.allowedServiceIds)
   const workingHours = normalizeWorkingHours(req.body?.workingHours)
@@ -381,7 +393,11 @@ router.post("/staff", async (req, res) => {
   if (!isValidFullName(name)) {
     return res.status(400).json({ error: "Please provide a valid full name." })
   }
-  const duplicate = await pool.query("SELECT id FROM users WHERE email = $1 LIMIT 1", [email])
+  if (!STAFF_EMAIL_PATTERN.test(email)) return res.status(400).json({ error: "Enter a valid e-mail address." })
+  if (!STAFF_PHONE_PATTERN.test(phone)) {
+    return res.status(400).json({ error: "Enter the phone number in international format, e.g. +919876543210." })
+  }
+  const duplicate = await pool.query("SELECT id FROM users WHERE lower(btrim(email)) = $1 LIMIT 1", [email])
   if (duplicate.rows.length) {
     return res.status(409).json({ error: "Email already exists" })
   }
@@ -447,7 +463,9 @@ router.post("/staff", async (req, res) => {
 
 router.patch("/staff/:id", async (req, res) => {
   const { id } = req.params
-  const { name, email, phone, role } = req.body ?? {}
+  const { name, role } = req.body ?? {}
+  const email = req.body?.email === undefined ? undefined : normalizeStaffEmail(req.body.email)
+  const phone = typeof req.body?.phone === "string" ? req.body.phone.trim() : req.body?.phone
   const genderTypeProvided = req.body?.genderType !== undefined
   const genderType = normalizeStylistGenderType(req.body?.genderType)
   const allowedServicesProvided = req.body?.allowedServiceIds !== undefined
@@ -464,6 +482,12 @@ router.patch("/staff/:id", async (req, res) => {
   }
   if (name && !isValidFullName(name)) {
     return res.status(400).json({ error: "Please provide a valid full name." })
+  }
+  if (typeof email === "string" && !STAFF_EMAIL_PATTERN.test(email)) {
+    return res.status(400).json({ error: "Enter a valid e-mail address." })
+  }
+  if (typeof phone === "string" && !STAFF_PHONE_PATTERN.test(phone)) {
+    return res.status(400).json({ error: "Enter the phone number in international format, e.g. +919876543210." })
   }
 
   const patch = {
@@ -484,6 +508,9 @@ router.patch("/staff/:id", async (req, res) => {
           email = COALESCE($3, email),
           phone = COALESCE($4, phone),
           role = COALESCE($5, role),
+          -- Changing who this account is (e-mail, phone, role) ends any session that was
+          -- opened under the old identity; they sign in again.
+          staff_session_jti = CASE WHEN $3 IS NOT NULL OR $4 IS NOT NULL OR $5 IS NOT NULL THEN NULL ELSE staff_session_jti END,
           updated_at = NOW()
         WHERE id = $1 AND role IN ('STAFF', 'RECEPTIONIST')
         RETURNING id, name, email, role, phone, account_status, created_at

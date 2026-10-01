@@ -2,7 +2,7 @@ import crypto from "node:crypto"
 
 import { cachedRead, onCacheInvalidated } from "../lib/cache.js"
 import { tryAcquireSlot } from "../lib/redis.js"
-import { notifyUser } from "../notifications/service.js"
+import { notifyUser, pruneOldNotifications } from "../notifications/service.js"
 import { buildQueueProjection } from "./estimator.js"
 import {
   QUEUE_BROADCAST_SLOT_KEY,
@@ -349,6 +349,11 @@ export async function runQueueReminderSweep({ now = Date.now() } = {}) {
   if (await tryAcquireSlot(QUEUE_REMINDER_PRUNE_SLOT_KEY, 24 * 60 * 60 * 1000)) {
     await pruneQueueReminders({ retentionDays: config.reminderRetentionDays }).catch(error =>
       console.error("queue_reminder_prune_failed", {
+        message: error instanceof Error ? error.message : error,
+      })
+    )
+    await pruneOldNotifications().catch(error =>
+      console.error("notification_prune_failed", {
         message: error instanceof Error ? error.message : error,
       })
     )

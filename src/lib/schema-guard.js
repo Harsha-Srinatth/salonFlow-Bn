@@ -1,4 +1,5 @@
 import { pool } from "./db-pool.js"
+import { ensureBaseSchema } from "./base-schema.js"
 
 /**
  * Single advisory lock shared by every schema module.
@@ -46,7 +47,16 @@ export function createSchemaEnsurer({ name, migrate }) {
     const client = await pool.connect()
     try {
       await client.query("BEGIN")
+      // DDL such as `ALTER TABLE users …` needs an exclusive lock. If a slow query holds
+      // the table, the ALTER waits — and while it waits, every new query on that table
+      // queues behind it, which takes the whole app down. A short lock_timeout makes the
+      // bootstrap fail fast instead (the failure is not cached, so the next request or
+      // process start retries) and never holds other traffic hostage.
+      await client.query(`SET LOCAL lock_timeout = '${Number(process.env.SCHEMA_LOCK_TIMEOUT_MS ?? 5000)}ms'`)
       await client.query("SELECT pg_advisory_xact_lock($1)", [SCHEMA_BOOTSTRAP_LOCK_ID])
+      // Whichever module boots first creates `users`/`salons` on an empty database, so
+      // module order never matters. A no-op (one lookup) on an existing database.
+      await ensureBaseSchema(client)
       await migrate(client)
       await client.query("COMMIT")
     } catch (error) {

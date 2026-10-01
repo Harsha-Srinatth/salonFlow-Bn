@@ -1,6 +1,8 @@
 import { SignJWT, jwtVerify } from "jose"
 
 const encoder = new TextEncoder()
+// Dev-only fallbacks. In production `lib/env-check.js` refuses to boot without real
+// values, so these can never sign a session someone else could forge.
 const ACCESS_SECRET = encoder.encode(process.env.STAFF_ACCESS_SECRET ?? "staff-access-dev-secret")
 const SETUP_SECRET = encoder.encode(process.env.STAFF_SETUP_SECRET ?? "staff-setup-dev-secret")
 
@@ -11,8 +13,10 @@ const SETUP_SECRET = encoder.encode(process.env.STAFF_SETUP_SECRET ?? "staff-set
  * @param {string} userId Database user primary key
  * @returns {Promise<string>} Signed JWT
  */
-export async function signStaffAccessToken(userId) {
-  return new SignJWT({})
+export async function signStaffAccessToken(userId, jti = undefined) {
+  const jwt = new SignJWT({})
+  if (jti) jwt.setJti(jti)
+  return jwt
     .setProtectedHeader({ alg: "HS256" })
     .setSubject(`${userId}`)
     .setIssuedAt()

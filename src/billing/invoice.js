@@ -1,4 +1,5 @@
 import PDFDocument from "pdfkit"
+import { SALON_TIMEZONE } from "../lib/salon-time.js"
 
 function toCurrency(value) {
   return `Rs ${Number(value ?? 0).toFixed(2)}`
@@ -19,7 +20,7 @@ export async function buildBookingInvoicePdf({ booking }) {
     doc.moveDown()
     doc.fontSize(11).text(`Invoice: ${booking.invoiceNumber ?? `INV-${booking.id}`}`)
     doc.text(`Booking ID: ${booking.id}`)
-    doc.text(`Date/Time: ${new Date(booking.startsAt).toLocaleString()}`)
+    doc.text(`Date/Time: ${new Date(booking.startsAt).toLocaleString("en-IN", { timeZone: SALON_TIMEZONE })}`)
     doc.text(`Status: ${booking.status}`)
     doc.moveDown()
     doc.text("Services:")

@@ -33,6 +33,7 @@ export async function uploadServiceImageDataUri(dataUri) {
   const uploaded = await cloudinary.uploader.upload(value, {
     folder: "sahasra/services",
     resource_type: "image",
+    timeout: 60_000,
   })
   return {
     url: uploaded.secure_url ?? uploaded.url ?? "",

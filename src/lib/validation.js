@@ -1,3 +1,5 @@
+import { salonDateString } from "./salon-time.js"
+
 /**
  * Shared field validation for user-supplied profile data.
  *
@@ -52,10 +54,7 @@ const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/
  * day early. Comparing strings sidesteps that entirely.
  */
 function todayIsoDate() {
-  const now = new Date()
-  const month = `${now.getMonth() + 1}`.padStart(2, "0")
-  const day = `${now.getDate()}`.padStart(2, "0")
-  return `${now.getFullYear()}-${month}-${day}`
+  return salonDateString(new Date())
 }
 
 /**

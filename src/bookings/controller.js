@@ -73,7 +73,7 @@ export async function listBookingsController(req, res) {
   return sendPayload(req, res, 200, result)
 }
 
-export async function updateBookingStatusController(req, res, { publishEvent }) {
+export async function updateBookingStatusController(req, res, { publishEvent, publishPaymentEvent }) {
   try {
     const body = readBody(req)
     const booking = await transitionAdminBookingStatus({
@@ -81,9 +81,11 @@ export async function updateBookingStatusController(req, res, { publishEvent }) 
       requestedStatus: body?.status,
       actorUserId: req.appUser.id,
       publishEvent,
+      publishPaymentEvent,
     })
     return sendPayload(req, res, 200, { booking })
   } catch (error) {
+    if (error?.code === "BAD_REQUEST") return sendPayload(req, res, 400, { error: error.message })
     if (error?.code === "FORBIDDEN") return sendPayload(req, res, 403, { error: error.message })
     if (error?.code === "INVALID_STATUS") return sendPayload(req, res, 400, { error: error.message })
     if (error?.code === "NOT_FOUND") return sendPayload(req, res, 404, { error: error.message })
@@ -368,6 +370,7 @@ export async function startStylistBookingController(req, res, { publishEvent }) 
     return sendPayload(req, res, 200, { booking })
   } catch (error) {
     if (error?.code === "NOT_FOUND") return sendPayload(req, res, 404, { error: error.message })
+    if (error?.code === "INVALID_TRANSITION") return sendPayload(req, res, 409, { error: error.message })
     console.error("Failed to start stylist booking", error)
     return sendPayload(req, res, 500, { error: "Internal server error" })
   }
@@ -383,6 +386,7 @@ export async function completeStylistBookingController(req, res, { publishEvent 
     return sendPayload(req, res, 200, { booking })
   } catch (error) {
     if (error?.code === "NOT_FOUND") return sendPayload(req, res, 404, { error: error.message })
+    if (error?.code === "INVALID_TRANSITION") return sendPayload(req, res, 409, { error: error.message })
     console.error("Failed to complete stylist booking", error)
     return sendPayload(req, res, 500, { error: "Internal server error" })
   }

@@ -27,6 +27,8 @@ export async function verifyPasswordResetOobCode(oobCode) {
   const res = await fetch(`${RESET_PASSWORD_URL}?key=${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // A hung Google endpoint must not hold the request (and a worker) open indefinitely.
+    signal: AbortSignal.timeout(10_000),
     body: JSON.stringify({ oobCode }),
   })
   const data = await res.json().catch(() => ({}))
@@ -65,6 +67,8 @@ export async function sendPasswordResetEmailToolkit(email, continueUrl) {
   const res = await fetch(`${SEND_OOB_CODE_URL}?key=${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // A hung Google endpoint must not hold the request (and a worker) open indefinitely.
+    signal: AbortSignal.timeout(10_000),
     body: JSON.stringify(body),
   })
   const data = await res.json().catch(() => ({}))
@@ -87,6 +91,8 @@ export async function consumePasswordResetOobWithPassword(oobCode, newPassword) 
   const res = await fetch(`${RESET_PASSWORD_URL}?key=${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // A hung Google endpoint must not hold the request (and a worker) open indefinitely.
+    signal: AbortSignal.timeout(10_000),
     body: JSON.stringify({ oobCode, newPassword }),
   })
   const data = await res.json().catch(() => ({}))

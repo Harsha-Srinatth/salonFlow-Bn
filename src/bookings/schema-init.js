@@ -1,5 +1,5 @@
 import { createSchemaEnsurer } from "../lib/schema-guard.js"
-import { ensureStylistProfilesForActiveStaff, removeLegacyDemoSeedBookings } from "./repository.js"
+import { ensureStylistProfilesForActiveStaff } from "./repository.js"
 
 export const ensureBookingsSchema = createSchemaEnsurer({
   name: "bookings",
@@ -42,12 +42,24 @@ export const ensureBookingsSchema = createSchemaEnsurer({
     await client.query(`
       CREATE INDEX IF NOT EXISTS bookings_status_idx ON bookings(status)
     `)
+    // "Remove from my history" hides a booking from its customer; the row, its payments and
+    // its invoice stay (financial records, complaints and first-booking history depend on them).
+    await client.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS hidden_from_customer_at TIMESTAMPTZ`)
     await client.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_email VARCHAR(255)`)
     await client.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_email_enc TEXT`)
     await client.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(32)`)
     await client.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_phone_enc TEXT`)
     await client.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS stylist_id UUID REFERENCES users(id) ON DELETE SET NULL`)
     await client.query(`CREATE INDEX IF NOT EXISTS bookings_stylist_id_idx ON bookings(stylist_id)`)
+    // Lookup paths that had no index and degraded to full scans as `bookings` grew
+    // (measured at 300k rows: customer list 0.45-0.7 s, first-booking check 270 ms):
+    //  - the customer portal finds "my bookings" by e-mail OR phone,
+    //  - first-booking / referral checks count by `created_by`,
+    //  - the admin list orders by `created_at DESC, id DESC`.
+    await client.query(`CREATE INDEX IF NOT EXISTS bookings_customer_email_lower_idx ON bookings (lower(customer_email))`)
+    await client.query(`CREATE INDEX IF NOT EXISTS bookings_customer_phone_idx ON bookings (customer_phone)`)
+    await client.query(`CREATE INDEX IF NOT EXISTS bookings_created_by_idx ON bookings (created_by)`)
+    await client.query(`CREATE INDEX IF NOT EXISTS bookings_created_at_id_idx ON bookings (created_at DESC NULLS LAST, id DESC)`)
     await client.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS service_items_json JSONB NOT NULL DEFAULT '[]'::jsonb`)
     await client.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS total_amount NUMERIC(12,2) NOT NULL DEFAULT 0`)
     await client.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(12,2) NOT NULL DEFAULT 0`)
@@ -151,8 +163,27 @@ export const ensureBookingsSchema = createSchemaEnsurer({
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `)
+    // Every booking list/queue query sums payments per booking with a correlated subselect.
+    // Without this index each of those is a sequential scan of the whole payments table,
+    // once per booking row returned (admin list: 5.5 s at 315k payments; now ~10 ms).
+    await client.query(`CREATE INDEX IF NOT EXISTS payment_transactions_booking_id_idx ON payment_transactions(booking_id)`)
     await client.query(`CREATE INDEX IF NOT EXISTS payment_transactions_collected_at_idx ON payment_transactions(collected_at)`)
     await client.query(`CREATE INDEX IF NOT EXISTS payment_transactions_mode_idx ON payment_transactions(payment_mode)`)
+    // Backstop for concurrent cancels: at most one refund row per booking. Skipped (not
+    // failed) if historic data already holds duplicates, so a boot never breaks on it.
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM payment_transactions
+          WHERE source_type = 'REFUND' AND booking_id IS NOT NULL
+          GROUP BY booking_id HAVING COUNT(*) > 1
+        ) THEN
+          CREATE UNIQUE INDEX IF NOT EXISTS payment_transactions_one_refund_per_booking
+          ON payment_transactions (booking_id) WHERE source_type = 'REFUND';
+        END IF;
+      END $$;
+    `)
     await client.query(`
       CREATE TABLE IF NOT EXISTS audit_logs (
         id UUID PRIMARY KEY,
@@ -175,6 +206,5 @@ export const ensureBookingsSchema = createSchemaEnsurer({
     // `users` exclusively for its `ALTER TABLE` and is waiting for the very
     // tables being written here.
     await ensureStylistProfilesForActiveStaff(client)
-    await removeLegacyDemoSeedBookings(client)
   },
 })

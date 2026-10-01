@@ -1,4 +1,14 @@
+import { v4 as uuid } from "uuid"
+import {
+  addDaysToDateString,
+  isTodayOrTomorrowInSalon,
+  salonDateString,
+  salonMinutesOfDay,
+  salonWallClockToDate,
+} from "../lib/salon-time.js"
 import { auditAuthAsync } from "../lib/audit-log.js"
+import { generateInvoiceNumber } from "../lib/invoice-number.js"
+import { roundMoney } from "../lib/money.js"
 import { normalizeCustomerGender, parseSelectableGender } from "../lib/gender.js"
 import { notifyRole, notifyUser } from "../notifications/service.js"
 import {
@@ -35,7 +45,7 @@ import {
   updateBookingSchedule,
   listQueueBookingsForRole,
   getBookingById,
-  deleteBookingById,
+  hideBookingFromCustomer,
   getPayrollPolicy,
   upsertPayrollPolicy,
   listMonthlyStylistDeductions,
@@ -51,6 +61,7 @@ import {
   listPaymentTransactions,
   getPaymentHistoryById,
   withTransaction,
+  lockStylistSchedule,
 } from "./repository.js"
 
 const SALON_OPEN_MINUTES = 8 * 60
@@ -82,19 +93,11 @@ function hhmmToMinutes(value, fallback) {
 }
 
 function buildDateAtMinutes(dateIso, minutes) {
-  const date = new Date(`${dateIso}T00:00:00`)
-  date.setMinutes(minutes, 0, 0)
-  return date
+  return salonWallClockToDate(dateIso, minutes)
 }
 
 function isTodayOrTomorrow(dateIso) {
-  const target = new Date(`${dateIso}T00:00:00`)
-  if (Number.isNaN(target.getTime())) return false
-  const now = new Date()
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-  const tomorrow = new Date(today)
-  tomorrow.setDate(today.getDate() + 1)
-  return target.getTime() === today.getTime() || target.getTime() === tomorrow.getTime()
+  return isTodayOrTomorrowInSalon(dateIso)
 }
 
 function overlaps(aStart, aEnd, bStart, bEnd) {
@@ -106,13 +109,44 @@ function roundUpToSlotMinute(totalMinutes, stepMinutes) {
 }
 
 export async function listAdminBookings(query) {
-  await autoCompleteOverdueStartedBookings({})
-  await autoMarkNoShowBookings({})
   const filters = sanitizeBookingFilters(query)
   return listBookings(filters)
 }
 
-export async function transitionAdminBookingStatus({ bookingId, requestedStatus, actorUserId, publishEvent }) {
+/**
+ * Admin "Cancelled" used to flip the status and nothing else: no refund row, no message to
+ * the customer, so a paid booking could disappear with the money unaccounted for. It now
+ * takes the same atomic refund-policy path as every other cancellation and tells the customer.
+ */
+async function cancelBookingAsStaff({ bookingId, actorUserId, publishEvent, publishPaymentEvent }) {
+  const existing = await getBookingById(bookingId)
+  if (!existing) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
+  if (normalizeBookingStatus(existing.status) === "CANCELLED") return existing
+  const { booking, refundPreview, refundPaymentId } = await cancelBookingWithRefund({
+    bookingId,
+    actorUserId,
+    auditAction: "booking_status_updated",
+  })
+  await publishRefundPayment(refundPaymentId, publishPaymentEvent)
+  const updated = await getBookingById(bookingId)
+  auditAuthAsync("auth", "admin_booking_status_updated", { adminUserId: actorUserId, bookingId, toStatus: "CANCELLED" })
+  if (booking.createdBy) {
+    notifyUser({
+      userId: booking.createdBy,
+      type: "BOOKING_CANCELLED",
+      title: "Booking cancelled by the salon",
+      body:
+        refundPreview.refundAmount > 0
+          ? `Your ${booking.service} booking on ${formatNotifyDateTime(booking.startsAt)} was cancelled. Rs ${refundPreview.refundAmount.toFixed(2)} (${refundPreview.refundPercent}%) will be refunded.`
+          : `Your ${booking.service} booking on ${formatNotifyDateTime(booking.startsAt)} was cancelled.`,
+      data: { bookingId },
+    }).catch(error => console.error("notify_staff_cancel_failed", error))
+  }
+  if (updated && publishEvent) publishEvent("booking.updated.v1", updated)
+  return updated
+}
+
+export async function transitionAdminBookingStatus({ bookingId, requestedStatus, actorUserId, publishEvent, publishPaymentEvent }) {
   const nextStatus = normalizeBookingStatus(requestedStatus)
   if (!nextStatus) {
     const error = new Error("Invalid status")
@@ -124,6 +158,9 @@ export async function transitionAdminBookingStatus({ bookingId, requestedStatus,
       new Error("Admins cannot change booking status to STARTED or COMPLETED. Only the assigned stylist can update service status."),
       { code: "FORBIDDEN" }
     )
+  }
+  if (nextStatus === "CANCELLED") {
+    return cancelBookingAsStaff({ bookingId, actorUserId, publishEvent, publishPaymentEvent })
   }
   const booking = await withTransaction(async client => {
     const current = await getBookingForUpdate(client, bookingId)
@@ -174,6 +211,36 @@ function isValidPhone(phone) {
   return /^\+?[1-9]\d{7,14}$/.test(`${phone ?? ""}`.trim())
 }
 
+/**
+ * Server-side enforcement of the rules the slot picker already shows. The picker hides
+ * past times, closed hours, lunch, stylist shifts and leave, but the create endpoints
+ * used to accept any time the client sent, so a direct API call could book 3 a.m. or an
+ * hour ago. Runs inside the booking transaction (after the stylist lock) so it sees the
+ * same data the insert will.
+ */
+async function assertBookableWindow({ client, stylistId, startsAt, durationMinutes, graceMinutes }) {
+  const fail = message => Object.assign(new Error(message), { code: "BAD_REQUEST" })
+  if (startsAt.getTime() < Date.now() - graceMinutes * 60_000) throw fail("That time has already passed")
+  const startMinute = salonMinutesOfDay(startsAt)
+  const endMinute = startMinute + durationMinutes
+  if (startMinute < SALON_OPEN_MINUTES || endMinute > SALON_CLOSE_MINUTES) {
+    throw fail("The salon is closed at that time (open 08:00 to 23:00)")
+  }
+  if (overlaps(startMinute, endMinute, LUNCH_START_MINUTES, LUNCH_END_MINUTES)) throw fail("That time falls in the lunch break")
+  const { rows: shiftRows } = await client.query(
+    "SELECT shift_start, shift_end FROM stylist_shift_windows WHERE stylist_id = $1 LIMIT 1",
+    [stylistId]
+  )
+  const shiftStart = hhmmToMinutes(shiftRows[0]?.shift_start, SALON_OPEN_MINUTES)
+  const shiftEnd = hhmmToMinutes(shiftRows[0]?.shift_end, SALON_CLOSE_MINUTES)
+  if (startMinute < shiftStart || endMinute > shiftEnd) throw fail("That stylist is not working at that time")
+  const { rows: leaveRows } = await client.query(
+    "SELECT 1 FROM stylist_leaves WHERE stylist_id = $1 AND $2::date BETWEEN leave_start AND leave_end LIMIT 1",
+    [stylistId, salonDateString(startsAt)]
+  )
+  if (leaveRows.length) throw fail("That stylist is on leave that day")
+}
+
 export async function createReceptionBooking({ payload, actorUserId, publishEvent, publishPaymentEvent }) {
   const customerName = `${payload.customerName ?? ""}`.trim()
   const customerEmail = `${payload.customerEmail ?? ""}`.trim().toLowerCase()
@@ -207,9 +274,9 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
     customerGender,
   })
   const comboId = `${payload.comboId ?? ""}`.trim() || null
-  const membershipSegment =
-    `${payload.membershipSegment ?? ""}`.trim().toUpperCase() ||
-    (await getMembershipSegmentForUser(customerAccount.id))
+  // The tier decides the discount, so it is read from the customer's record. Taking it from
+  // the request body let any receptionist pick PREMIUM pricing for any customer.
+  const membershipSegment = await getMembershipSegmentForUser(customerAccount.id)
   const pricing = await computeBookingOfferPricing({
     serviceIds: resolvedServiceIds,
     membershipSegment,
@@ -221,48 +288,72 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
     0
   )
   const serviceName = selectedServices.map(service => service.name).join(", ")
-  const availableStylists = await listRecommendedStylists({
-    serviceIds: resolvedServiceIds,
-    startsAt: new Date(startsAt).toISOString(),
-    durationMinutes,
-    customerGender,
-  })
-  const stylistAllowed = availableStylists.some(stylist => stylist.id === stylistId)
-  if (!stylistAllowed) {
-    throw Object.assign(new Error("Selected stylist cannot perform this service at selected slot"), { code: "BAD_REQUEST" })
-  }
   const paymentMode = `${payload.paymentMode ?? ""}`.trim().toUpperCase()
   const walkInPaymentModes = ["OFFLINE_CASH", "OFFLINE_UPI"]
   if (!walkInPaymentModes.includes(paymentMode)) {
     throw Object.assign(new Error("paymentMode must be OFFLINE_CASH or OFFLINE_UPI"), { code: "BAD_REQUEST" })
   }
-  const booking = await createBooking({
-    customerName,
-    customerEmail,
-    customerPhone,
-    serviceName,
-    serviceItems: pricing.serviceItems,
-    stylistId,
-    startsAt,
-    durationMinutes,
-    totalAmount: pricing.totalAmount,
-    discountAmount: pricing.discountAmount,
-    payableAmount: pricing.payableAmount,
-    invoiceNumber: `INV-${Date.now()}`,
-    status: "CONFIRMED",
-    createdBy: customerAccount.id,
-  })
-  if (booking?.id && pricing.payableAmount > 0) {
-    await recordReceptionPayment({
-      payload: {
-        sourceType: "BOOKING",
-        bookingId: booking.id,
-        paymentMode,
-        amount: pricing.payableAmount,
-      },
-      actorUserId,
-      publishPaymentEvent,
+  const bookingId = uuid()
+  // Availability re-check, booking and payment in one transaction, serialised per
+  // stylist (see createCustomerBooking for why).
+  const { booking, paymentId } = await withTransaction(async client => {
+    await lockStylistSchedule(client, stylistId)
+    await assertBookableWindow({ client, stylistId, startsAt: new Date(startsAt), durationMinutes, graceMinutes: 15 })
+    const availableStylists = await listRecommendedStylists({
+      serviceIds: resolvedServiceIds,
+      startsAt: new Date(startsAt).toISOString(),
+      durationMinutes,
+      customerGender,
+      db: client,
     })
+    if (!availableStylists.some(stylist => stylist.id === stylistId)) {
+      throw Object.assign(new Error("Selected stylist cannot perform this service at selected slot"), { code: "BAD_REQUEST" })
+    }
+    const created = await createBooking({
+      id: bookingId,
+      db: client,
+      customerName,
+      customerEmail,
+      customerPhone,
+      serviceName,
+      serviceItems: pricing.serviceItems,
+      stylistId,
+      startsAt,
+      durationMinutes,
+      totalAmount: pricing.totalAmount,
+      discountAmount: pricing.discountAmount,
+      payableAmount: pricing.payableAmount,
+      invoiceNumber: generateInvoiceNumber(),
+      status: "CONFIRMED",
+      createdBy: customerAccount.id,
+    })
+    let insertedPaymentId = null
+    if (created?.id && pricing.payableAmount > 0) {
+      const inserted = await createPaymentTransaction({
+        db: client,
+        bookingId: created.id,
+        sourceType: "BOOKING",
+        customerName: created.customer,
+        customerEmail: created.customerEmail,
+        customerPhone: created.customerPhone,
+        amount: pricing.payableAmount,
+        paymentMode,
+        collectedBy: actorUserId,
+      })
+      insertedPaymentId = inserted?.id ?? null
+    }
+    return { booking: created, paymentId: insertedPaymentId }
+  })
+  if (paymentId) {
+    const payment = await getPaymentHistoryById(paymentId)
+    auditAuthAsync("auth", "reception_payment_recorded", {
+      receptionistUserId: actorUserId,
+      paymentId,
+      sourceType: "BOOKING",
+      paymentMode,
+      amount: pricing.payableAmount,
+    })
+    if (payment && publishPaymentEvent) publishPaymentEvent("payment.updated.v1", payment)
   }
   auditAuthAsync("auth", "reception_booking_created", {
     receptionistUserId: actorUserId,
@@ -357,8 +448,6 @@ export async function autoMarkNoShowBookings({ publishEvent } = {}) {
 }
 
 export async function listCustomerBookings({ customerEmail, customerPhone, limit, offset, publishEvent } = {}) {
-  await autoCompleteOverdueStartedBookings({ publishEvent })
-  await autoMarkNoShowBookings({ publishEvent })
   return listBookingsForCustomer({ customerEmail, customerPhone, limit, offset })
 }
 
@@ -370,7 +459,7 @@ export async function listAdminServices() {
   return listServiceCatalog({ includeInactive: true })
 }
 
-export async function listRecommendedStylists({ serviceIds, startsAt, durationMinutes, customerGender }) {
+export async function listRecommendedStylists({ serviceIds, startsAt, durationMinutes, customerGender, db }) {
   const safeServiceIds = Array.isArray(serviceIds) ? serviceIds.filter(Boolean) : []
   if (!safeServiceIds.length) return []
   return findAvailableStylistsForServices({
@@ -378,6 +467,7 @@ export async function listRecommendedStylists({ serviceIds, startsAt, durationMi
     startsAt,
     durationMinutes,
     customerGender,
+    db,
   })
 }
 
@@ -393,10 +483,9 @@ export async function listAvailableSlots({ serviceIds, date, customerGender }) {
   const totalDuration = selectedServices.reduce((sum, item) => sum + Number(item.duration ?? item.durationMinutes ?? 0), 0)
   const eligibleStylists = await listEligibleStylistsForServices({ serviceIds: safeServiceIds, customerGender })
   const stylistIds = eligibleStylists.map(item => item.id)
-  const dayStart = `${date}T00:00:00.000Z`
-  const nextDay = new Date(`${date}T00:00:00.000Z`)
-  nextDay.setUTCDate(nextDay.getUTCDate() + 1)
-  const dayEnd = nextDay.toISOString()
+  // The salon's calendar day, expressed as real instants (not "00:00 UTC").
+  const dayStart = salonWallClockToDate(date, 0).toISOString()
+  const dayEnd = salonWallClockToDate(addDaysToDateString(date, 1), 0).toISOString()
   const booked = await listBookingsForStylistsInRange({ stylistIds, rangeStart: dayStart, rangeEnd: dayEnd })
   const leaves = await listLeavesForStylistsOnDate({ stylistIds, date })
   const onLeaveSet = new Set(leaves.map(item => item.stylist_id))
@@ -410,15 +499,8 @@ export async function listAvailableSlots({ serviceIds, date, customerGender }) {
   }
   const slots = []
   const now = new Date()
-  const requestedDate = new Date(`${date}T00:00:00`)
-  const isToday =
-    requestedDate.getFullYear() === now.getFullYear() &&
-    requestedDate.getMonth() === now.getMonth() &&
-    requestedDate.getDate() === now.getDate()
-  const nowMinutesRaw =
-    now.getHours() * 60 +
-    now.getMinutes() +
-    (now.getSeconds() > 0 || now.getMilliseconds() > 0 ? 1 : 0)
+  const isToday = date === salonDateString(now)
+  const nowMinutesRaw = salonMinutesOfDay(now) + (now.getSeconds() > 0 || now.getMilliseconds() > 0 ? 1 : 0)
   const earliestMinute = isToday
     ? Math.max(SALON_OPEN_MINUTES, roundUpToSlotMinute(nowMinutesRaw, SLOT_STEP_MINUTES))
     : SALON_OPEN_MINUTES
@@ -584,9 +666,11 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
   if (!stylistId) throw Object.assign(new Error("Stylist is required"), { code: "BAD_REQUEST" })
   const customerGender = normalizeCustomerGender(actorUser?.gender)
   const membershipSegment = `${actorUser?.membershipSegment ?? "FREE"}`.trim().toUpperCase() || "FREE"
-  const startsAt = startsAtRaw ? new Date(startsAtRaw) : new Date(`${bookingDate}T${bookingTime}:00`)
+  const startsAt = startsAtRaw
+    ? new Date(startsAtRaw)
+    : salonWallClockToDate(bookingDate, hhmmToMinutes(bookingTime, Number.NaN))
   if (Number.isNaN(startsAt.getTime())) throw Object.assign(new Error("Valid slot time is required"), { code: "BAD_REQUEST" })
-  const bookingDateIso = startsAt.toISOString().slice(0, 10)
+  const bookingDateIso = salonDateString(startsAt)
   if (!isTodayOrTomorrow(bookingDateIso)) throw Object.assign(new Error("Bookings are allowed only for today or tomorrow"), { code: "BAD_REQUEST" })
 
   const serviceCatalog = await listServiceCatalog()
@@ -598,20 +682,6 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
   })
   const selectedServices = serviceCatalog.filter(service => serviceIds.includes(service.id))
   const durationMinutes = selectedServices.reduce((sum, service) => sum + Number(service.duration ?? service.durationMinutes ?? 0), 0)
-  const availableStylists = await listRecommendedStylists({
-    serviceIds,
-    startsAt: startsAt.toISOString(),
-    durationMinutes,
-    customerGender,
-  })
-  const isChosenStylistAvailable = availableStylists.some(stylist => stylist.id === stylistId)
-  if (!isChosenStylistAvailable) {
-    const alternatives = availableStylists.slice(0, 3).map(item => ({ id: item.id, name: item.name }))
-    throw Object.assign(new Error("Selected stylist is not available for this slot"), {
-      code: "STYLIST_UNAVAILABLE",
-      alternatives,
-    })
-  }
 
   // First-time-customer discount and wallet credit are both applied on top of
   // offer/membership pricing, then folded into discountAmount so
@@ -619,63 +689,107 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
   // revenue reports. Both are always recomputed by the server from the
   // customer's actual booking history / wallet balance — never trusted from
   // the client. Order: offers -> first-booking discount -> wallet credit.
-  let payableAmount = pricing.payableAmount
-  let discountAmount = pricing.discountAmount
-  let firstBookingDiscountAmount = 0
-  const firstBookingDiscount = await computeFirstBookingDiscount({ userId: actorUser.id, payableAmount })
-  if (firstBookingDiscount.discountAmount > 0) {
-    firstBookingDiscountAmount = firstBookingDiscount.discountAmount
-    payableAmount = Math.max(0, payableAmount - firstBookingDiscountAmount)
-    discountAmount += firstBookingDiscountAmount
-  }
-  // A won reward-card voucher makes one specific selected service free.
-  // Claimed atomically UP FRONT (before any discount is applied) so a lost
-  // race against a concurrent claim falls back to "no voucher" instead of
-  // granting the discount without ever actually consuming a voucher.
-  // Not available alongside a combo: combo pricing only returns each item's
-  // standalone price (not its share of the bundle), so "free" would be
-  // computed against the wrong base and over-discount the bundle total.
-  let voucherWinId = null
-  let voucherDiscountAmount = 0
+  const firstBookingDiscount = await computeFirstBookingDiscount({ userId: actorUser.id, payableAmount: pricing.payableAmount })
   const requestedVoucherServiceId = `${payload?.redeemRewardServiceId ?? ""}`.trim()
-  if (!comboId && requestedVoucherServiceId && serviceIds.includes(requestedVoucherServiceId)) {
-    const voucherItem = pricing.serviceItems.find(item => item.id === requestedVoucherServiceId)
-    if (voucherItem) {
-      const claim = await claimRewardVoucher({ userId: actorUser.id, serviceId: requestedVoucherServiceId })
-      if (claim) {
-        const itemFinalPrice = Number(voucherItem.basePrice ?? 0) * (1 - Number(voucherItem.discountPercent ?? 0) / 100)
-        voucherDiscountAmount = Math.max(0, Math.min(payableAmount, Math.round(itemFinalPrice * 100) / 100))
-        voucherWinId = claim.winId
-        payableAmount = Math.max(0, payableAmount - voucherDiscountAmount)
-        discountAmount += voucherDiscountAmount
+  const bookingId = uuid()
+
+  // Everything that must be true together happens in ONE transaction, serialised per
+  // stylist: re-checking availability, consuming the voucher and wallet credit, writing
+  // the booking and its payment. Checking availability outside and inserting afterwards
+  // let two concurrent customers both pass the check and double-book the stylist; and
+  // consuming credit before a failed insert burned it with no booking to show for it.
+  const created = await withTransaction(async client => {
+    await lockStylistSchedule(client, stylistId)
+    await assertBookableWindow({ client, stylistId, startsAt, durationMinutes, graceMinutes: 2 })
+    const availableStylists = await listRecommendedStylists({
+      serviceIds,
+      startsAt: startsAt.toISOString(),
+      durationMinutes,
+      customerGender,
+      db: client,
+    })
+    if (!availableStylists.some(stylist => stylist.id === stylistId)) {
+      const alternatives = availableStylists.slice(0, 3).map(item => ({ id: item.id, name: item.name }))
+      throw Object.assign(new Error("Selected stylist is not available for this slot"), {
+        code: "STYLIST_UNAVAILABLE",
+        alternatives,
+      })
+    }
+
+    let payableAmount = pricing.payableAmount
+    let discountAmount = pricing.discountAmount
+    let firstBookingDiscountAmount = 0
+    if (firstBookingDiscount.discountAmount > 0) {
+      firstBookingDiscountAmount = firstBookingDiscount.discountAmount
+      payableAmount = roundMoney(Math.max(0, payableAmount - firstBookingDiscountAmount))
+      discountAmount += firstBookingDiscountAmount
+    }
+    // A won reward-card voucher makes one specific selected service free. Claimed
+    // atomically before any discount is applied so a lost race falls back to "no
+    // voucher". Not available alongside a combo: combo pricing only returns each
+    // item's standalone price, so "free" would be computed against the wrong base.
+    let voucherWinId = null
+    let voucherDiscountAmount = 0
+    if (!comboId && requestedVoucherServiceId && serviceIds.includes(requestedVoucherServiceId)) {
+      const voucherItem = pricing.serviceItems.find(item => item.id === requestedVoucherServiceId)
+      if (voucherItem) {
+        const claim = await claimRewardVoucher({ userId: actorUser.id, serviceId: requestedVoucherServiceId, db: client })
+        if (claim) {
+          const itemFinalPrice = Number(voucherItem.basePrice ?? 0) * (1 - Number(voucherItem.discountPercent ?? 0) / 100)
+          voucherDiscountAmount = Math.max(0, Math.min(payableAmount, Math.round(itemFinalPrice * 100) / 100))
+          voucherWinId = claim.winId
+          payableAmount = roundMoney(Math.max(0, payableAmount - voucherDiscountAmount))
+          discountAmount += voucherDiscountAmount
+        }
       }
     }
-  }
-  let walletRedeemAmount = 0
-  if (payload?.useWalletCredit && payableAmount > 0) {
-    walletRedeemAmount = await redeemWalletCredit({ userId: actorUser.id, maxAmount: payableAmount })
-    if (walletRedeemAmount > 0) {
-      payableAmount = Math.max(0, payableAmount - walletRedeemAmount)
-      discountAmount += walletRedeemAmount
+    let walletRedeemAmount = 0
+    if (payload?.useWalletCredit && payableAmount > 0) {
+      walletRedeemAmount = await redeemWalletCredit({ userId: actorUser.id, maxAmount: payableAmount, bookingId, db: client })
+      if (walletRedeemAmount > 0) {
+        payableAmount = Math.max(0, payableAmount - walletRedeemAmount)
+        discountAmount += walletRedeemAmount
+      }
     }
-  }
 
-  const booking = await createBooking({
-    customerName: actorUser.name,
-    customerEmail: actorUser.email,
-    customerPhone: actorUser.phone,
-    serviceName: selectedServices.map(service => service.name).join(", "),
-    serviceItems: pricing.serviceItems,
-    stylistId,
-    startsAt: startsAt.toISOString(),
-    durationMinutes,
-    totalAmount: pricing.totalAmount,
-    discountAmount,
-    payableAmount,
-    invoiceNumber: `INV-${Date.now()}`,
-    status: "CONFIRMED",
-    createdBy: actorUser.id,
+    const booking = await createBooking({
+      id: bookingId,
+      db: client,
+      customerName: actorUser.name,
+      customerEmail: actorUser.email,
+      customerPhone: actorUser.phone,
+      serviceName: selectedServices.map(service => service.name).join(", "),
+      serviceItems: pricing.serviceItems,
+      stylistId,
+      startsAt: startsAt.toISOString(),
+      durationMinutes,
+      totalAmount: pricing.totalAmount,
+      discountAmount,
+      payableAmount,
+      invoiceNumber: generateInvoiceNumber(),
+      status: "CONFIRMED",
+      createdBy: actorUser.id,
+    })
+    if (voucherWinId) await attachRewardVoucherToBooking({ winId: voucherWinId, bookingId: booking.id, db: client })
+    let paymentId = null
+    if (payableAmount > 0) {
+      const inserted = await createPaymentTransaction({
+        db: client,
+        bookingId: booking.id,
+        sourceType: "BOOKING",
+        customerName: booking.customer,
+        customerEmail: booking.customerEmail,
+        customerPhone: booking.customerPhone,
+        amount: payableAmount,
+        paymentMode: "ONLINE",
+        collectedBy: actorUser.id,
+      })
+      paymentId = inserted?.id ?? null
+    }
+    return { booking, paymentId, payableAmount, walletRedeemAmount, firstBookingDiscountAmount, voucherDiscountAmount }
   })
+
+  const { booking, paymentId, payableAmount, walletRedeemAmount, firstBookingDiscountAmount, voucherDiscountAmount } = created
   auditAuthAsync("auth", "customer_booking_created", {
     customerUserId: actorUser.id,
     bookingId: booking?.id,
@@ -684,45 +798,35 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
     firstBookingDiscountAmount,
     voucherDiscountAmount,
   })
-  if (booking?.id && voucherWinId) {
-    attachRewardVoucherToBooking({ winId: voucherWinId, bookingId: booking.id }).catch(error =>
-      console.error("attach_reward_voucher_to_booking_failed", error)
-    )
-  }
-  if (booking?.id && payableAmount > 0) {
-    await recordReceptionPayment({
-      payload: {
-        sourceType: "BOOKING",
-        bookingId: booking.id,
-        paymentMode: "ONLINE",
-        amount: payableAmount,
-      },
-      actorUserId: actorUser.id,
-      publishPaymentEvent,
+  if (paymentId) {
+    const payment = await getPaymentHistoryById(paymentId)
+    auditAuthAsync("auth", "reception_payment_recorded", {
+      receptionistUserId: actorUser.id,
+      paymentId,
+      sourceType: "BOOKING",
+      paymentMode: "ONLINE",
+      amount: payableAmount,
     })
+    if (payment && publishPaymentEvent) publishPaymentEvent("payment.updated.v1", payment)
   }
-  if (booking?.id) {
-    booking.walletRedeemAmount = walletRedeemAmount
-    booking.firstBookingDiscountAmount = firstBookingDiscountAmount
-    booking.voucherDiscountAmount = voucherDiscountAmount
-    notifyUser({
-      userId: actorUser.id,
-      type: "BOOKING_CONFIRMED",
-      title: "Booking confirmed",
-      body: `${booking.service} on ${formatNotifyDateTime(booking.startsAt)} with ${booking.stylistName ?? "your stylist"} is confirmed.`,
-      data: { bookingId: booking.id },
-    }).catch(error => console.error("notify_booking_confirmed_failed", error))
-    if (stylistId) {
-      notifyUser({
-        userId: stylistId,
-        type: "BOOKING_ASSIGNED",
-        title: "New appointment assigned",
-        body: `${booking.service} for ${booking.customer} at ${formatNotifyDateTime(booking.startsAt)}.`,
-        data: { bookingId: booking.id },
-      }).catch(error => console.error("notify_booking_assigned_failed", error))
-    }
-  }
-  if (booking && publishEvent) publishEvent("booking.updated.v1", booking)
+  booking.walletRedeemAmount = walletRedeemAmount
+  booking.firstBookingDiscountAmount = firstBookingDiscountAmount
+  booking.voucherDiscountAmount = voucherDiscountAmount
+  notifyUser({
+    userId: actorUser.id,
+    type: "BOOKING_CONFIRMED",
+    title: "Booking confirmed",
+    body: `${booking.service} on ${formatNotifyDateTime(booking.startsAt)} with ${booking.stylistName ?? "your stylist"} is confirmed.`,
+    data: { bookingId: booking.id },
+  }).catch(error => console.error("notify_booking_confirmed_failed", error))
+  notifyUser({
+    userId: stylistId,
+    type: "BOOKING_ASSIGNED",
+    title: "New appointment assigned",
+    body: `${booking.service} for ${booking.customer} at ${formatNotifyDateTime(booking.startsAt)}.`,
+    data: { bookingId: booking.id },
+  }).catch(error => console.error("notify_booking_assigned_failed", error))
+  if (publishEvent) publishEvent("booking.updated.v1", booking)
   return booking
 }
 
@@ -741,14 +845,29 @@ export async function addAdminStylistLeave({ stylistId, leaveStart, leaveEnd, no
 }
 
 export async function listRoleQueue({ role, userId, limit, publishEvent } = {}) {
-  await autoCompleteOverdueStartedBookings({ publishEvent })
-  await autoMarkNoShowBookings({ publishEvent })
   return listQueueBookingsForRole({ role, userId, limit })
+}
+
+/**
+ * A stylist start/complete matched no row. Three different situations look identical to
+ * the UPDATE, and each deserves its own answer:
+ *  - the booking is already in the requested state (double tap, retry) -> succeed, unchanged;
+ *  - the booking exists for this stylist but is in the wrong state (cancelled, not started)
+ *    -> 409, never silently flipped;
+ *  - it is not theirs / does not exist -> 404.
+ */
+async function resolveStylistTransitionMiss({ bookingId, actorUserId, expected }) {
+  const existing = await getBookingById(bookingId)
+  if (!existing || existing.stylistId !== actorUserId) {
+    throw Object.assign(new Error("Booking not found for stylist"), { code: "NOT_FOUND" })
+  }
+  if (normalizeBookingStatus(existing.status) === expected) return existing
+  throw Object.assign(new Error(`Booking is ${existing.status}; it cannot move to ${expected}`), { code: "INVALID_TRANSITION" })
 }
 
 export async function startStylistBooking({ bookingId, actorUserId, publishEvent }) {
   const booking = await markBookingStarted({ bookingId, stylistId: actorUserId })
-  if (!booking) throw Object.assign(new Error("Booking not found for stylist"), { code: "NOT_FOUND" })
+  if (!booking) return resolveStylistTransitionMiss({ bookingId, actorUserId, expected: "STARTED" })
   if (publishEvent) publishEvent("booking.updated.v1", booking)
   return booking
 }
@@ -761,7 +880,7 @@ export async function completeStylistBooking({ bookingId, actorUserId, publishEv
     graceMinutes: policy.graceMinutes,
     penaltyPerMinute: policy.penaltyPerMinute,
   })
-  if (!booking) throw Object.assign(new Error("Booking not found for stylist"), { code: "NOT_FOUND" })
+  if (!booking) return resolveStylistTransitionMiss({ bookingId, actorUserId, expected: "COMPLETED" })
   if (booking.createdBy) {
     rewardReferralIfEligible({ userId: booking.createdBy }).catch(error =>
       console.error("reward_referral_stylist_complete_failed", error)
@@ -801,7 +920,7 @@ const PAYMENT_SOURCES = ["BOOKING", "WALKIN"]
 export async function recordReceptionPayment({ payload, actorUserId, publishPaymentEvent }) {
   const sourceType = `${payload?.sourceType ?? "BOOKING"}`.trim().toUpperCase()
   const paymentMode = `${payload?.paymentMode ?? ""}`.trim().toUpperCase()
-  const amount = Number(payload?.amount ?? 0)
+  const amount = roundMoney(payload?.amount)
   const bookingId = `${payload?.bookingId ?? ""}`.trim() || null
   const customerName = `${payload?.customerName ?? ""}`.trim()
   const customerEmail = `${payload?.customerEmail ?? ""}`.trim().toLowerCase()
@@ -810,45 +929,50 @@ export async function recordReceptionPayment({ payload, actorUserId, publishPaym
   if (!PAYMENT_SOURCES.includes(sourceType)) throw Object.assign(new Error("Invalid sourceType"), { code: "BAD_REQUEST" })
   if (!PAYMENT_MODES.includes(paymentMode)) throw Object.assign(new Error("Invalid paymentMode"), { code: "BAD_REQUEST" })
   if (!Number.isFinite(amount) || amount <= 0) throw Object.assign(new Error("amount must be greater than 0"), { code: "BAD_REQUEST" })
-
-  let resolvedBookingId = bookingId
-  let resolvedCustomerName = customerName
-  let resolvedCustomerEmail = customerEmail
-  let resolvedCustomerPhone = customerPhone
-  if (sourceType === "BOOKING") {
-    if (!bookingId) throw Object.assign(new Error("bookingId is required for booking payment"), { code: "BAD_REQUEST" })
-    const booking = await getBookingById(bookingId)
-    if (!booking) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
-    // Guards against double-collecting: bookings are already paid in full at creation time
-    // (both online self-service and reception walk-in), so without this check the reception
-    // "Collect payment" panel could record a second payment against an already-settled booking.
-    const alreadyPaid = Number(booking.paidAmount ?? 0)
-    const remainingDue = Math.round((Number(booking.payableAmount ?? 0) - alreadyPaid) * 100) / 100
-    if (amount > remainingDue + 0.01) {
-      throw Object.assign(
-        new Error(`Amount exceeds the remaining balance due (Rs ${Math.max(0, remainingDue).toFixed(2)})`),
-        { code: "BAD_REQUEST" }
-      )
-    }
-    resolvedBookingId = booking.id
-    resolvedCustomerName = booking.customer
-    resolvedCustomerEmail = booking.customerEmail
-    resolvedCustomerPhone = booking.customerPhone
-  } else if (!resolvedCustomerName) {
+  if (sourceType === "BOOKING" && !bookingId) throw Object.assign(new Error("bookingId is required for booking payment"), { code: "BAD_REQUEST" })
+  if (sourceType !== "BOOKING" && !customerName) {
     throw Object.assign(new Error("customerName is required for walk-in payment"), { code: "BAD_REQUEST" })
   }
 
-  const inserted = await createPaymentTransaction({
-    bookingId: resolvedBookingId,
-    sourceType,
-    customerName: resolvedCustomerName,
-    customerEmail: resolvedCustomerEmail,
-    customerPhone: resolvedCustomerPhone,
-    amount,
-    paymentMode,
-    collectedBy: actorUserId,
+  // The balance check and the insert happen under a lock on the booking row. As two separate
+  // steps, two concurrent "collect payment" clicks both saw the full balance due and both
+  // recorded it, collecting twice for one booking.
+  const insertedId = await withTransaction(async client => {
+    let target = { bookingId: null, name: customerName, email: customerEmail, phone: customerPhone }
+    if (sourceType === "BOOKING") {
+      const locked = await getBookingForUpdate(client, bookingId)
+      if (!locked) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
+      const booking = await getBookingById(bookingId, client)
+      const status = normalizeBookingStatus(booking.status)
+      // Money is not collected against a booking that was cancelled or never attended.
+      if (status === "CANCELLED" || status === "NO-SHOW") {
+        throw Object.assign(new Error(`Cannot collect payment for a ${status.toLowerCase()} booking`), { code: "BAD_REQUEST" })
+      }
+      // Bookings are normally paid in full when created, so without this the "Collect payment"
+      // panel could record a second payment against an already-settled booking.
+      const remainingDue = roundMoney(Number(booking.payableAmount ?? 0) - Number(booking.paidAmount ?? 0))
+      if (amount > remainingDue + 0.01) {
+        throw Object.assign(
+          new Error(`Amount exceeds the remaining balance due (Rs ${Math.max(0, remainingDue).toFixed(2)})`),
+          { code: "BAD_REQUEST" }
+        )
+      }
+      target = { bookingId: booking.id, name: booking.customer, email: booking.customerEmail, phone: booking.customerPhone }
+    }
+    const inserted = await createPaymentTransaction({
+      db: client,
+      bookingId: target.bookingId,
+      sourceType,
+      customerName: target.name,
+      customerEmail: target.email,
+      customerPhone: target.phone,
+      amount,
+      paymentMode,
+      collectedBy: actorUserId,
+    })
+    return inserted?.id ?? null
   })
-  const payment = inserted?.id ? await getPaymentHistoryById(inserted.id) : null
+  const payment = insertedId ? await getPaymentHistoryById(insertedId) : null
   auditAuthAsync("auth", "reception_payment_recorded", {
     receptionistUserId: actorUserId,
     paymentId: payment?.id,
@@ -885,37 +1009,106 @@ export async function getAdminRevenueReport({ month, paymentMode, from, to, limi
   }
 }
 
+/**
+ * Moves a booking to another stylist and/or time. Done under the same per-stylist lock and
+ * with the same rules as a new booking: the target stylist must be free (ignoring this very
+ * booking), inside opening hours/shift and not on leave, and only an upcoming booking can be
+ * moved — it used to overwrite anything, even resurrecting a CANCELLED or COMPLETED booking
+ * as CONFIRMED, and could stack two customers on one stylist.
+ */
+async function rescheduleBooking({ bookingId, payload, actorUserId }) {
+  const fail = (message, code = "BAD_REQUEST") => Object.assign(new Error(message), { code })
+  const requestedStart = payload?.startsAt ? new Date(payload.startsAt) : null
+  if (requestedStart && Number.isNaN(requestedStart.getTime())) throw fail("Valid slot time is required")
+  const requestedStylistId = `${payload?.stylistId ?? ""}`.trim() || null
+  if (!requestedStart && !requestedStylistId) throw fail("Provide a new time and/or a stylist")
+
+  const result = await withTransaction(async client => {
+    const locked = await getBookingForUpdate(client, bookingId)
+    if (!locked) throw fail("Booking not found", "NOT_FOUND")
+    const current = await getBookingById(bookingId, client)
+    if (!["PENDING", "CONFIRMED"].includes(normalizeBookingStatus(current.status))) {
+      throw fail("Only an upcoming booking can be moved", "INVALID_TRANSITION")
+    }
+    const stylistId = requestedStylistId ?? current.stylistId
+    if (!stylistId) throw fail("A stylist is required")
+    const startsAt = requestedStart ?? new Date(current.startsAt)
+    await lockStylistSchedule(client, stylistId)
+    const { rows: stylistRows } = await client.query(
+      "SELECT 1 FROM users WHERE id = $1 AND role = 'STAFF' AND account_status = 'ACTIVE'",
+      [stylistId]
+    )
+    if (!stylistRows.length) throw fail("Selected stylist is not an active stylist")
+    await assertBookableWindow({ client, stylistId, startsAt, durationMinutes: current.durationMinutes, graceMinutes: 15 })
+    const serviceIds = (current.services ?? []).map(item => item?.id).filter(Boolean)
+    const free = serviceIds.length
+      ? (
+          await findAvailableStylistsForServices({
+            serviceIds,
+            startsAt: startsAt.toISOString(),
+            durationMinutes: current.durationMinutes,
+            customerGender: "UNSPECIFIED",
+            db: client,
+            excludeBookingId: bookingId,
+          })
+        ).some(stylist => stylist.id === stylistId)
+      : !(
+          await client.query(
+            `SELECT 1 FROM bookings b
+             WHERE b.stylist_id = $1 AND b.id <> $2 AND b.status IN ('PENDING','CONFIRMED','STARTED')
+               AND tstzrange(b.starts_at, b.starts_at + make_interval(mins => b.duration_minutes), '[)')
+                   && tstzrange($3::timestamptz, $3::timestamptz + make_interval(mins => $4::int), '[)')
+             LIMIT 1`,
+            [stylistId, bookingId, startsAt.toISOString(), current.durationMinutes]
+          )
+        ).rows.length
+    if (!free) throw fail("Selected stylist cannot perform this service at selected slot")
+    const updated = await updateBookingSchedule({
+      bookingId,
+      stylistId,
+      startsAt: startsAt.toISOString(),
+      durationMinutes: current.durationMinutes,
+      updatedBy: actorUserId,
+      status: "CONFIRMED",
+      db: client,
+      onlyIfStatusIn: ["PENDING", "CONFIRMED"],
+    })
+    if (!updated) throw fail("Only an upcoming booking can be moved", "INVALID_TRANSITION")
+    return { updated, previousStylistId: current.stylistId, previousStart: current.startsAt }
+  })
+
+  const { updated, previousStylistId, previousStart } = result
+  const changedTime = new Date(previousStart).getTime() !== new Date(updated.startsAt).getTime()
+  const changedStylist = previousStylistId !== updated.stylistId
+  if (updated.createdBy && (changedTime || changedStylist)) {
+    notifyUser({
+      userId: updated.createdBy,
+      type: "BOOKING_RESCHEDULED",
+      title: "Your appointment was updated",
+      body: `${updated.service} is now ${formatNotifyDateTime(updated.startsAt)} with ${updated.stylistName ?? "your stylist"}.`,
+      data: { bookingId },
+    }).catch(error => console.error("notify_booking_rescheduled_failed", error))
+  }
+  if (changedStylist && updated.stylistId) {
+    notifyUser({
+      userId: updated.stylistId,
+      type: "BOOKING_ASSIGNED",
+      title: "New appointment assigned",
+      body: `${updated.service} for ${updated.customer} at ${formatNotifyDateTime(updated.startsAt)}.`,
+      data: { bookingId },
+    }).catch(error => console.error("notify_booking_assigned_failed", error))
+  }
+  return updated
+}
+
 export async function updateReceptionBookingLifecycle({ bookingId, payload, actorUserId, publishEvent, publishPaymentEvent }) {
   const action = `${payload?.action ?? ""}`.trim().toLowerCase()
   if (!bookingId || !action) throw Object.assign(new Error("bookingId and action are required"), { code: "BAD_REQUEST" })
   let updated = null
   if (action === "cancel") {
-    // Reuses the same tiered refund policy as a customer's own cancellation
-    // (100%/50%/0% by time-to-appointment) — every booking here was already
-    // paid in full at creation, so cancelling without this would leave the
-    // collected payment unaccounted for with no refund ever recorded.
-    const current = await getBookingById(bookingId)
-    if (!current) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
-    const currentStatus = normalizeBookingStatus(current.status)
-    if (!canTransitionBookingStatus(currentStatus, "CANCELLED")) {
-      throw Object.assign(new Error("This booking cannot be cancelled"), { code: "INVALID_TRANSITION" })
-    }
-    const refundPreview = computeCancellationRefund({
-      payableAmount: current.payableAmount,
-      startsAt: current.startsAt,
-    })
-    if (!refundPreview.canCancel) {
-      throw Object.assign(new Error(refundPreview.reason ?? "Cannot cancel this booking"), { code: "BAD_REQUEST" })
-    }
-    updated = await updateBookingSchedule({ bookingId, status: "CANCELLED", updatedBy: actorUserId })
-    if (refundPreview.refundAmount > 0) {
-      await recordBookingRefund({
-        booking: current,
-        amount: refundPreview.refundAmount,
-        actorUserId,
-        publishPaymentEvent,
-      })
-    }
+    // Same tiered refund policy as a customer's own cancellation (100%/50%/0% by
+    // time-to-appointment), applied atomically, and the customer is told.
+    updated = await cancelBookingAsStaff({ bookingId, actorUserId, publishEvent: null, publishPaymentEvent })
   } else if (action === "complete") {
     // Only the assigned stylist can complete service (see completeStylistBooking) —
     // that path also computes overtime/penalty from the real start time and triggers
@@ -925,18 +1118,7 @@ export async function updateReceptionBookingLifecycle({ bookingId, payload, acto
       { code: "FORBIDDEN" }
     )
   } else if (action === "assign" || action === "reschedule") {
-    const startsAt = payload?.startsAt ? new Date(payload.startsAt).toISOString() : null
-    const stylistId = `${payload?.stylistId ?? ""}`.trim() || null
-    const current = await getBookingById(bookingId)
-    if (!current) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
-    updated = await updateBookingSchedule({
-      bookingId,
-      stylistId,
-      startsAt,
-      durationMinutes: current.durationMinutes,
-      updatedBy: actorUserId,
-      status: "CONFIRMED",
-    })
+    updated = await rescheduleBooking({ bookingId, payload, actorUserId })
   } else {
     throw Object.assign(new Error("Unsupported action"), { code: "BAD_REQUEST" })
   }
@@ -995,51 +1177,88 @@ export async function getCustomerCancellationPreview({ bookingId, actorUser }) {
   }
 }
 
-async function recordBookingRefund({ booking, amount, actorUserId, publishPaymentEvent }) {
-  const refundAmount = Number(amount ?? 0)
-  if (!Number.isFinite(refundAmount) || refundAmount <= 0) return null
-  const inserted = await createPaymentTransaction({
-    bookingId: booking.id,
-    sourceType: "REFUND",
-    customerName: booking.customer,
-    customerEmail: booking.customerEmail,
-    customerPhone: booking.customerPhone,
-    amount: refundAmount,
-    paymentMode: "ONLINE",
-    collectedBy: actorUserId,
+/**
+ * Cancels a booking and records its refund as ONE atomic unit.
+ *
+ * The row is locked for the duration, the status change is conditional on the booking
+ * still being cancellable, and the refund is written in the same transaction. Two
+ * concurrent cancels (double-click, retry, two tabs) therefore serialise: the second
+ * finds the booking already cancelled and gets INVALID_TRANSITION instead of paying a
+ * second refund.
+ *
+ * @param {{ bookingId: string, actorUserId: string, authorize?: (booking: object) => void }} params
+ */
+async function cancelBookingWithRefund({ bookingId, actorUserId, authorize, auditAction = null }) {
+  return withTransaction(async client => {
+    const locked = await getBookingForUpdate(client, bookingId)
+    if (!locked) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
+    const booking = await getBookingById(bookingId, client)
+    authorize?.(booking)
+    const status = normalizeBookingStatus(booking.status)
+    if (!canTransitionBookingStatus(status, "CANCELLED")) {
+      throw Object.assign(new Error("This booking cannot be cancelled"), { code: "INVALID_TRANSITION" })
+    }
+    const refundPreview = computeCancellationRefund({
+      payableAmount: booking.payableAmount,
+      startsAt: booking.startsAt,
+    })
+    if (!refundPreview.canCancel) {
+      throw Object.assign(new Error(refundPreview.reason ?? "Cannot cancel this booking"), { code: "BAD_REQUEST" })
+    }
+    const updated = await updateBookingSchedule({
+      bookingId,
+      status: "CANCELLED",
+      updatedBy: actorUserId,
+      db: client,
+      onlyIfStatusIn: ["PENDING", "CONFIRMED"],
+    })
+    if (!updated) throw Object.assign(new Error("This booking cannot be cancelled"), { code: "INVALID_TRANSITION" })
+    if (auditAction) {
+      await insertAuditLog(client, {
+        action: auditAction,
+        performedBy: actorUserId,
+        resourceId: bookingId,
+        originalValue: { status },
+        newValue: { status: "CANCELLED", refundAmount: refundPreview.refundAmount },
+      })
+    }
+    let refundPaymentId = null
+    if (refundPreview.refundAmount > 0) {
+      const inserted = await createPaymentTransaction({
+        db: client,
+        bookingId: booking.id,
+        sourceType: "REFUND",
+        customerName: booking.customer,
+        customerEmail: booking.customerEmail,
+        customerPhone: booking.customerPhone,
+        amount: refundPreview.refundAmount,
+        paymentMode: "ONLINE",
+        collectedBy: actorUserId,
+      })
+      refundPaymentId = inserted?.id ?? null
+    }
+    return { booking, refundPreview, refundPaymentId }
   })
-  const payment = inserted?.id ? await getPaymentHistoryById(inserted.id) : null
+}
+
+async function publishRefundPayment(refundPaymentId, publishPaymentEvent) {
+  if (!refundPaymentId) return null
+  const payment = await getPaymentHistoryById(refundPaymentId)
   if (payment && publishPaymentEvent) publishPaymentEvent("payment.updated.v1", payment)
   return payment
 }
 
 export async function cancelCustomerBooking({ bookingId, actorUser, publishEvent, publishPaymentEvent }) {
-  const booking = await getBookingById(bookingId)
-  if (!booking) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
-  if (!customerOwnsBooking(booking, actorUser)) {
-    throw Object.assign(new Error("Forbidden"), { code: "FORBIDDEN" })
-  }
-  const status = normalizeBookingStatus(booking.status)
-  if (!canTransitionBookingStatus(status, "CANCELLED")) {
-    throw Object.assign(new Error("This booking cannot be cancelled"), { code: "INVALID_TRANSITION" })
-  }
-  const refundPreview = computeCancellationRefund({
-    payableAmount: booking.payableAmount,
-    startsAt: booking.startsAt,
+  const { booking, refundPreview, refundPaymentId } = await cancelBookingWithRefund({
+    bookingId,
+    actorUserId: actorUser.id,
+    authorize: current => {
+      if (!customerOwnsBooking(current, actorUser)) {
+        throw Object.assign(new Error("Forbidden"), { code: "FORBIDDEN" })
+      }
+    },
   })
-  if (!refundPreview.canCancel) {
-    throw Object.assign(new Error(refundPreview.reason ?? "Cannot cancel this booking"), { code: "BAD_REQUEST" })
-  }
-  await updateBookingSchedule({ bookingId, status: "CANCELLED", updatedBy: actorUser.id })
-  let refundPayment = null
-  if (refundPreview.refundAmount > 0) {
-    refundPayment = await recordBookingRefund({
-      booking,
-      amount: refundPreview.refundAmount,
-      actorUserId: actorUser.id,
-      publishPaymentEvent,
-    })
-  }
+  const refundPayment = await publishRefundPayment(refundPaymentId, publishPaymentEvent)
   const updated = await getBookingById(bookingId)
   auditAuthAsync("auth", "customer_booking_cancelled", {
     customerUserId: actorUser.id,
@@ -1099,13 +1318,15 @@ export async function removeCustomerBookingFromHistory({ bookingId, actorUser, p
       { code: "BAD_REQUEST" }
     )
   }
-  const deleted = await deleteBookingById(bookingId)
+  // Hide, never delete: the booking's payments, invoice and any complaint must survive, and
+  // the first-booking discount counts every booking a customer has ever made.
+  const deleted = await hideBookingFromCustomer(bookingId)
   if (!deleted) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
   auditAuthAsync("auth", "customer_booking_deleted", {
     customerUserId: actorUser.id,
     bookingId,
   })
-  if (publishEvent) publishEvent("booking.deleted.v1", { id: bookingId })
+  if (publishEvent) publishEvent("booking.deleted.v1", { id: bookingId, createdBy: actorUser.id })
   return { id: bookingId, deleted: true }
 }
 

@@ -1,5 +1,6 @@
 import { v4 as uuid } from "uuid"
 import { pool } from "../lib/db-pool.js"
+import { SALON_TODAY_START_SQL, SALON_TOMORROW_START_SQL } from "../lib/salon-time.js"
 import { decryptPiiText } from "../security/crypto-envelope.js"
 import { ownerEmailHash, ownerPhoneHash } from "./tickets.js"
 
@@ -68,8 +69,8 @@ export async function loadActiveQueueRows() {
       WHERE (
         (
           b.status IN ('PENDING', 'CONFIRMED')
-          AND b.starts_at >= date_trunc('day', NOW())
-          AND b.starts_at < date_trunc('day', NOW()) + interval '1 day'
+          AND b.starts_at >= ${SALON_TODAY_START_SQL}
+          AND b.starts_at < ${SALON_TOMORROW_START_SQL}
         )
         OR b.status = 'STARTED'
       )
