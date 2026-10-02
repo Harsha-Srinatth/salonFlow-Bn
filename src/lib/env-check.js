@@ -24,6 +24,13 @@ export function assertProductionEnv(env = process.env) {
       problems.push(`${name} must be a random value of at least 32 characters`)
     }
   }
+  if (`${env.RAZORPAY_KEY_ID ?? ""}`.trim()) {
+    if (!`${env.RAZORPAY_KEY_SECRET ?? ""}`.trim()) problems.push("RAZORPAY_KEY_SECRET is not set")
+    if (!`${env.RAZORPAY_WEBHOOK_SECRET ?? ""}`.trim()) problems.push("RAZORPAY_WEBHOOK_SECRET is not set (webhooks cannot be verified)")
+    if (`${env.RAZORPAY_KEY_ID}`.startsWith("rzp_test_")) {
+      console.warn("env_check_warning", { message: "RAZORPAY_KEY_ID is a TEST key: no real money will move." })
+    }
+  }
   if (`${env.STAFF_ACCESS_SECRET ?? ""}` && env.STAFF_ACCESS_SECRET === env.STAFF_SETUP_SECRET) {
     problems.push("STAFF_ACCESS_SECRET and STAFF_SETUP_SECRET must differ")
   }

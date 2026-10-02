@@ -28,6 +28,7 @@ import {
   lookupReceptionCustomer,
   transitionAdminBookingStatus,
   updateReceptionBookingLifecycle,
+  getReceptionCancellationPreview,
   recordReceptionPayment,
   startStylistBooking,
   completeStylistBooking,
@@ -82,8 +83,9 @@ export async function updateBookingStatusController(req, res, { publishEvent, pu
       actorUserId: req.appUser.id,
       publishEvent,
       publishPaymentEvent,
+      refundPercent: body?.refundPercent ?? null,
     })
-    return sendPayload(req, res, 200, { booking })
+    return sendPayload(req, res, 200, { booking, refund: booking?.refund ?? null })
   } catch (error) {
     if (error?.code === "BAD_REQUEST") return sendPayload(req, res, 400, { error: error.message })
     if (error?.code === "FORBIDDEN") return sendPayload(req, res, 403, { error: error.message })
@@ -171,6 +173,7 @@ export async function createCustomerBookingController(req, res, { publishEvent, 
     if (error?.code === "STYLIST_UNAVAILABLE") {
       return sendPayload(req, res, 409, { error: error.message, alternatives: error.alternatives ?? [] })
     }
+    if (error?.code === "PAYMENT_REQUIRED") return sendPayload(req, res, 402, { error: error.message, code: "PAYMENT_REQUIRED" })
     if (error?.code === "BAD_REQUEST") return sendPayload(req, res, 400, { error: error.message })
     console.error("Failed to create customer booking", error)
     return sendPayload(req, res, 500, { error: "Internal server error" })
@@ -331,13 +334,24 @@ export async function updateReceptionBookingController(req, res, { publishEvent,
       publishEvent,
       publishPaymentEvent,
     })
-    return sendPayload(req, res, 200, { booking })
+    return sendPayload(req, res, 200, { booking, refund: booking?.refund ?? null })
   } catch (error) {
     if (error?.code === "BAD_REQUEST") return sendPayload(req, res, 400, { error: error.message })
     if (error?.code === "NOT_FOUND") return sendPayload(req, res, 404, { error: error.message })
     if (error?.code === "FORBIDDEN") return sendPayload(req, res, 403, { error: error.message })
     if (error?.code === "INVALID_TRANSITION") return sendPayload(req, res, 409, { error: error.message })
     console.error("Failed to update reception booking", error)
+    return sendPayload(req, res, 500, { error: "Internal server error" })
+  }
+}
+
+export async function getReceptionCancellationPreviewController(req, res) {
+  try {
+    const result = await getReceptionCancellationPreview({ bookingId: `${req.params.id ?? ""}`.trim() })
+    return sendPayload(req, res, 200, result)
+  } catch (error) {
+    if (error?.code === "NOT_FOUND") return sendPayload(req, res, 404, { error: error.message })
+    console.error("Failed to load reception cancellation preview", error)
     return sendPayload(req, res, 500, { error: "Internal server error" })
   }
 }

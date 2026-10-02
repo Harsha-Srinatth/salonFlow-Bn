@@ -7,8 +7,12 @@ import {
   salonWallClockToDate,
 } from "../lib/salon-time.js"
 import { auditAuthAsync } from "../lib/audit-log.js"
+import { pool } from "../lib/db-pool.js"
 import { generateInvoiceNumber } from "../lib/invoice-number.js"
 import { roundMoney } from "../lib/money.js"
+import { isOnlinePaymentRequired, isRazorpayConfigured } from "../payments/config.js"
+import { initiateCancellationRefund } from "../payments/cancel-refund.js"
+import { ensurePaymentsSchema } from "../payments/schema-init.js"
 import { normalizeCustomerGender, parseSelectableGender } from "../lib/gender.js"
 import { notifyRole, notifyUser } from "../notifications/service.js"
 import {
@@ -118,14 +122,15 @@ export async function listAdminBookings(query) {
  * the customer, so a paid booking could disappear with the money unaccounted for. It now
  * takes the same atomic refund-policy path as every other cancellation and tells the customer.
  */
-async function cancelBookingAsStaff({ bookingId, actorUserId, publishEvent, publishPaymentEvent }) {
+async function cancelBookingAsStaff({ bookingId, actorUserId, publishEvent, publishPaymentEvent, refundPercent = null }) {
   const existing = await getBookingById(bookingId)
   if (!existing) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
   if (normalizeBookingStatus(existing.status) === "CANCELLED") return existing
-  const { booking, refundPreview, refundPaymentId } = await cancelBookingWithRefund({
+  const { booking, refundPreview, refundPaymentId, gatewayRefund, gatewayRefundQueued } = await cancelBookingWithRefund({
     bookingId,
     actorUserId,
     auditAction: "booking_status_updated",
+    refundPercentOverride: refundPercent,
   })
   await publishRefundPayment(refundPaymentId, publishPaymentEvent)
   const updated = await getBookingById(bookingId)
@@ -142,11 +147,20 @@ async function cancelBookingAsStaff({ bookingId, actorUserId, publishEvent, publ
       data: { bookingId },
     }).catch(error => console.error("notify_staff_cancel_failed", error))
   }
+  if (updated) {
+    updated.refund = {
+      percent: refundPreview.refundPercent,
+      amount: refundPreview.refundAmount,
+      retainedAmount: refundPreview.retainedAmount,
+      basis: refundPreview.policyKey,
+      gatewayRefund: gatewayRefundQueued ? (gatewayRefund ? "INITIATED" : "PENDING") : null,
+    }
+  }
   if (updated && publishEvent) publishEvent("booking.updated.v1", updated)
   return updated
 }
 
-export async function transitionAdminBookingStatus({ bookingId, requestedStatus, actorUserId, publishEvent, publishPaymentEvent }) {
+export async function transitionAdminBookingStatus({ bookingId, requestedStatus, actorUserId, publishEvent, publishPaymentEvent, refundPercent = null }) {
   const nextStatus = normalizeBookingStatus(requestedStatus)
   if (!nextStatus) {
     const error = new Error("Invalid status")
@@ -160,7 +174,7 @@ export async function transitionAdminBookingStatus({ bookingId, requestedStatus,
     )
   }
   if (nextStatus === "CANCELLED") {
-    return cancelBookingAsStaff({ bookingId, actorUserId, publishEvent, publishPaymentEvent })
+    return cancelBookingAsStaff({ bookingId, actorUserId, publishEvent, publishPaymentEvent, refundPercent })
   }
   const booking = await withTransaction(async client => {
     const current = await getBookingForUpdate(client, bookingId)
@@ -655,7 +669,13 @@ export async function updateAdminService({ serviceId, payload, actorUserId }) {
   return updated
 }
 
-export async function createCustomerBooking({ payload, actorUser, publishEvent, publishPaymentEvent }) {
+/**
+ * Resolves and validates everything a customer booking needs *before* the transaction:
+ * request fields, slot time, server-side catalogue pricing and the first-booking discount.
+ * Shared by the legacy booking route, the payment quote and the post-payment confirmation, so
+ * all three always agree on the price.
+ */
+async function buildCustomerBookingContext({ payload, actorUser }) {
   const serviceIds = Array.isArray(payload.serviceIds) ? payload.serviceIds.map(item => `${item ?? ""}`.trim()).filter(Boolean) : []
   const stylistId = `${payload.stylistId ?? ""}`.trim()
   const comboId = `${payload.comboId ?? ""}`.trim() || null
@@ -691,104 +711,152 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
   // the client. Order: offers -> first-booking discount -> wallet credit.
   const firstBookingDiscount = await computeFirstBookingDiscount({ userId: actorUser.id, payableAmount: pricing.payableAmount })
   const requestedVoucherServiceId = `${payload?.redeemRewardServiceId ?? ""}`.trim()
-  const bookingId = uuid()
+  return {
+    serviceIds,
+    stylistId,
+    comboId,
+    startsAt,
+    customerGender,
+    pricing,
+    selectedServices,
+    durationMinutes,
+    firstBookingDiscount,
+    requestedVoucherServiceId,
+    bookingId: uuid(),
+  }
+}
 
-  // Everything that must be true together happens in ONE transaction, serialised per
-  // stylist: re-checking availability, consuming the voucher and wallet credit, writing
-  // the booking and its payment. Checking availability outside and inserting afterwards
-  // let two concurrent customers both pass the check and double-book the stylist; and
-  // consuming credit before a failed insert burned it with no booking to show for it.
-  const created = await withTransaction(async client => {
-    await lockStylistSchedule(client, stylistId)
-    await assertBookableWindow({ client, stylistId, startsAt, durationMinutes, graceMinutes: 2 })
-    const availableStylists = await listRecommendedStylists({
-      serviceIds,
-      startsAt: startsAt.toISOString(),
-      durationMinutes,
-      customerGender,
-      db: client,
-    })
-    if (!availableStylists.some(stylist => stylist.id === stylistId)) {
-      const alternatives = availableStylists.slice(0, 3).map(item => ({ id: item.id, name: item.name }))
-      throw Object.assign(new Error("Selected stylist is not available for this slot"), {
-        code: "STYLIST_UNAVAILABLE",
-        alternatives,
-      })
-    }
-
-    let payableAmount = pricing.payableAmount
-    let discountAmount = pricing.discountAmount
-    let firstBookingDiscountAmount = 0
-    if (firstBookingDiscount.discountAmount > 0) {
-      firstBookingDiscountAmount = firstBookingDiscount.discountAmount
-      payableAmount = roundMoney(Math.max(0, payableAmount - firstBookingDiscountAmount))
-      discountAmount += firstBookingDiscountAmount
-    }
-    // A won reward-card voucher makes one specific selected service free. Claimed
-    // atomically before any discount is applied so a lost race falls back to "no
-    // voucher". Not available alongside a combo: combo pricing only returns each
-    // item's standalone price, so "free" would be computed against the wrong base.
-    let voucherWinId = null
-    let voucherDiscountAmount = 0
-    if (!comboId && requestedVoucherServiceId && serviceIds.includes(requestedVoucherServiceId)) {
-      const voucherItem = pricing.serviceItems.find(item => item.id === requestedVoucherServiceId)
-      if (voucherItem) {
-        const claim = await claimRewardVoucher({ userId: actorUser.id, serviceId: requestedVoucherServiceId, db: client })
-        if (claim) {
-          const itemFinalPrice = Number(voucherItem.basePrice ?? 0) * (1 - Number(voucherItem.discountPercent ?? 0) / 100)
-          voucherDiscountAmount = Math.max(0, Math.min(payableAmount, Math.round(itemFinalPrice * 100) / 100))
-          voucherWinId = claim.winId
-          payableAmount = roundMoney(Math.max(0, payableAmount - voucherDiscountAmount))
-          discountAmount += voucherDiscountAmount
-        }
-      }
-    }
-    let walletRedeemAmount = 0
-    if (payload?.useWalletCredit && payableAmount > 0) {
-      walletRedeemAmount = await redeemWalletCredit({ userId: actorUser.id, maxAmount: payableAmount, bookingId, db: client })
-      if (walletRedeemAmount > 0) {
-        payableAmount = Math.max(0, payableAmount - walletRedeemAmount)
-        discountAmount += walletRedeemAmount
-      }
-    }
-
-    const booking = await createBooking({
-      id: bookingId,
-      db: client,
-      customerName: actorUser.name,
-      customerEmail: actorUser.email,
-      customerPhone: actorUser.phone,
-      serviceName: selectedServices.map(service => service.name).join(", "),
-      serviceItems: pricing.serviceItems,
-      stylistId,
-      startsAt: startsAt.toISOString(),
-      durationMinutes,
-      totalAmount: pricing.totalAmount,
-      discountAmount,
-      payableAmount,
-      invoiceNumber: generateInvoiceNumber(),
-      status: "CONFIRMED",
-      createdBy: actorUser.id,
-    })
-    if (voucherWinId) await attachRewardVoucherToBooking({ winId: voucherWinId, bookingId: booking.id, db: client })
-    let paymentId = null
-    if (payableAmount > 0) {
-      const inserted = await createPaymentTransaction({
-        db: client,
-        bookingId: booking.id,
-        sourceType: "BOOKING",
-        customerName: booking.customer,
-        customerEmail: booking.customerEmail,
-        customerPhone: booking.customerPhone,
-        amount: payableAmount,
-        paymentMode: "ONLINE",
-        collectedBy: actorUser.id,
-      })
-      paymentId = inserted?.id ?? null
-    }
-    return { booking, paymentId, payableAmount, walletRedeemAmount, firstBookingDiscountAmount, voucherDiscountAmount }
+/**
+ * The booking transaction body. Runs on the caller's client so it can be composed with other
+ * writes (the payment settlement does exactly that).
+ *
+ * `mode`:
+ *  - "legacy": the original behaviour. Refused (PAYMENT_REQUIRED) when money is owed and online
+ *    payment is enforced, otherwise the customer would get an unpaid CONFIRMED booking.
+ *  - "quote":  does all the pricing, voucher and wallet work and then throws `{code:"QUOTE"}` so the
+ *    caller's transaction rolls back and nothing is consumed. Gives the exact payable amount.
+ *  - "paid":   used after a verified payment. Refuses (PRICE_CHANGED) if the recomputed payable
+ *    amount differs from what the customer actually paid.
+ */
+async function runCustomerBookingTransaction(client, ctx, { payload, actorUser, mode = "legacy", expectedPayableAmount = null }) {
+  const { serviceIds, stylistId, comboId, startsAt, customerGender, pricing, selectedServices, durationMinutes, firstBookingDiscount, requestedVoucherServiceId, bookingId } = ctx
+  await lockStylistSchedule(client, stylistId)
+  await assertBookableWindow({ client, stylistId, startsAt, durationMinutes, graceMinutes: 2 })
+  const availableStylists = await listRecommendedStylists({
+    serviceIds,
+    startsAt: startsAt.toISOString(),
+    durationMinutes,
+    customerGender,
+    db: client,
   })
+  if (!availableStylists.some(stylist => stylist.id === stylistId)) {
+    const alternatives = availableStylists.slice(0, 3).map(item => ({ id: item.id, name: item.name }))
+    throw Object.assign(new Error("Selected stylist is not available for this slot"), {
+      code: "STYLIST_UNAVAILABLE",
+      alternatives,
+    })
+  }
 
+  let payableAmount = pricing.payableAmount
+  let discountAmount = pricing.discountAmount
+  let firstBookingDiscountAmount = 0
+  if (firstBookingDiscount.discountAmount > 0) {
+    firstBookingDiscountAmount = firstBookingDiscount.discountAmount
+    payableAmount = roundMoney(Math.max(0, payableAmount - firstBookingDiscountAmount))
+    discountAmount += firstBookingDiscountAmount
+  }
+  // A won reward-card voucher makes one specific selected service free. Claimed
+  // atomically before any discount is applied so a lost race falls back to "no
+  // voucher". Not available alongside a combo: combo pricing only returns each
+  // item's standalone price, so "free" would be computed against the wrong base.
+  let voucherWinId = null
+  let voucherDiscountAmount = 0
+  if (!comboId && requestedVoucherServiceId && serviceIds.includes(requestedVoucherServiceId)) {
+    const voucherItem = pricing.serviceItems.find(item => item.id === requestedVoucherServiceId)
+    if (voucherItem) {
+      const claim = await claimRewardVoucher({ userId: actorUser.id, serviceId: requestedVoucherServiceId, db: client })
+      if (claim) {
+        const itemFinalPrice = Number(voucherItem.basePrice ?? 0) * (1 - Number(voucherItem.discountPercent ?? 0) / 100)
+        voucherDiscountAmount = Math.max(0, Math.min(payableAmount, Math.round(itemFinalPrice * 100) / 100))
+        voucherWinId = claim.winId
+        payableAmount = roundMoney(Math.max(0, payableAmount - voucherDiscountAmount))
+        discountAmount += voucherDiscountAmount
+      }
+    }
+  }
+  let walletRedeemAmount = 0
+  if (payload?.useWalletCredit && payableAmount > 0) {
+    walletRedeemAmount = await redeemWalletCredit({ userId: actorUser.id, maxAmount: payableAmount, bookingId, db: client })
+    if (walletRedeemAmount > 0) {
+      payableAmount = Math.max(0, payableAmount - walletRedeemAmount)
+      discountAmount += walletRedeemAmount
+    }
+  }
+  payableAmount = roundMoney(payableAmount)
+
+  if (mode === "quote") {
+    throw Object.assign(new Error("quote"), {
+      code: "QUOTE",
+      quote: {
+        totalAmount: roundMoney(pricing.totalAmount),
+        discountAmount: roundMoney(discountAmount),
+        payableAmount,
+        serviceName: selectedServices.map(service => service.name).join(", "),
+        startsAt: startsAt.toISOString(),
+        durationMinutes,
+      },
+    })
+  }
+  if (mode === "legacy" && payableAmount > 0 && isOnlinePaymentRequired()) {
+    throw Object.assign(new Error("Payment is required to confirm this booking"), { code: "PAYMENT_REQUIRED" })
+  }
+  if (mode === "paid" && payableAmount !== roundMoney(expectedPayableAmount)) {
+    throw Object.assign(new Error("The price changed after payment"), {
+      code: "PRICE_CHANGED",
+      expected: roundMoney(expectedPayableAmount),
+      actual: payableAmount,
+    })
+  }
+
+  const booking = await createBooking({
+    id: bookingId,
+    db: client,
+    customerName: actorUser.name,
+    customerEmail: actorUser.email,
+    customerPhone: actorUser.phone,
+    serviceName: selectedServices.map(service => service.name).join(", "),
+    serviceItems: pricing.serviceItems,
+    stylistId,
+    startsAt: startsAt.toISOString(),
+    durationMinutes,
+    totalAmount: pricing.totalAmount,
+    discountAmount,
+    payableAmount,
+    invoiceNumber: generateInvoiceNumber(),
+    status: "CONFIRMED",
+    createdBy: actorUser.id,
+  })
+  if (voucherWinId) await attachRewardVoucherToBooking({ winId: voucherWinId, bookingId: booking.id, db: client })
+  let paymentId = null
+  if (payableAmount > 0) {
+    const inserted = await createPaymentTransaction({
+      db: client,
+      bookingId: booking.id,
+      sourceType: "BOOKING",
+      customerName: booking.customer,
+      customerEmail: booking.customerEmail,
+      customerPhone: booking.customerPhone,
+      amount: payableAmount,
+      paymentMode: "ONLINE",
+      collectedBy: actorUser.id,
+    })
+    paymentId = inserted?.id ?? null
+  }
+  return { booking, paymentId, payableAmount, walletRedeemAmount, firstBookingDiscountAmount, voucherDiscountAmount }
+}
+
+/** Notifications, audit and realtime events that follow a committed booking. */
+export async function runPostBookingEffects({ created, actorUser, stylistId, publishEvent, publishPaymentEvent }) {
   const { booking, paymentId, payableAmount, walletRedeemAmount, firstBookingDiscountAmount, voucherDiscountAmount } = created
   auditAuthAsync("auth", "customer_booking_created", {
     customerUserId: actorUser.id,
@@ -799,7 +867,7 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
     voucherDiscountAmount,
   })
   if (paymentId) {
-    const payment = await getPaymentHistoryById(paymentId)
+    const payment = await getPaymentHistoryById(paymentId).catch(() => null)
     auditAuthAsync("auth", "reception_payment_recorded", {
       receptionistUserId: actorUser.id,
       paymentId,
@@ -827,7 +895,45 @@ export async function createCustomerBooking({ payload, actorUser, publishEvent, 
     data: { bookingId: booking.id },
   }).catch(error => console.error("notify_booking_assigned_failed", error))
   if (publishEvent) publishEvent("booking.updated.v1", booking)
-  return booking
+}
+
+export async function createCustomerBooking({ payload, actorUser, publishEvent, publishPaymentEvent }) {
+  const ctx = await buildCustomerBookingContext({ payload, actorUser })
+  // Everything that must be true together happens in ONE transaction, serialised per
+  // stylist: re-checking availability, consuming the voucher and wallet credit, writing
+  // the booking and its payment. Checking availability outside and inserting afterwards
+  // let two concurrent customers both pass the check and double-book the stylist; and
+  // consuming credit before a failed insert burned it with no booking to show for it.
+  const created = await withTransaction(client => runCustomerBookingTransaction(client, ctx, { payload, actorUser }))
+  await runPostBookingEffects({ created, actorUser, stylistId: ctx.stylistId, publishEvent, publishPaymentEvent })
+  return created.booking
+}
+
+/**
+ * What would this customer have to pay right now for this booking request? Computed by the
+ * very same code path as the booking itself, in a transaction that is always rolled back, so
+ * the quote can never drift from what the booking would really charge.
+ */
+export async function quoteCustomerBooking({ payload, actorUser }) {
+  const ctx = await buildCustomerBookingContext({ payload, actorUser })
+  try {
+    await withTransaction(client => runCustomerBookingTransaction(client, ctx, { payload, actorUser, mode: "quote" }))
+  } catch (error) {
+    if (error?.code === "QUOTE") return error.quote
+    throw error
+  }
+  throw new Error("quote did not complete")
+}
+
+/**
+ * Creates the booking for a payment that has already been verified. Runs on the settlement
+ * transaction's client; the caller owns commit/rollback and calls `runPostBookingEffects`
+ * after it commits.
+ */
+export async function createPaidCustomerBookingInTransaction(client, { payload, actorUser, expectedPayableAmount }) {
+  const ctx = await buildCustomerBookingContext({ payload, actorUser })
+  const created = await runCustomerBookingTransaction(client, ctx, { payload, actorUser, mode: "paid", expectedPayableAmount })
+  return { created, stylistId: ctx.stylistId }
 }
 
 export async function upsertAdminStylistShift({ stylistId, shiftStart, shiftEnd, isActive, actorUserId }) {
@@ -1101,6 +1207,48 @@ async function rescheduleBooking({ bookingId, payload, actorUserId }) {
   return updated
 }
 
+/**
+ * What the receptionist's cancel dialog needs: how much the salon holds for this booking, what the
+ * standard policy would refund (shown as the suggested option), and whether the money went through
+ * Razorpay (then the refund goes back to the customer's UPI/card, otherwise it is cash at the desk).
+ */
+export async function getReceptionCancellationPreview({ bookingId }) {
+  const booking = await getBookingById(bookingId)
+  if (!booking) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
+  const status = normalizeBookingStatus(booking.status)
+  if (!["PENDING", "CONFIRMED"].includes(status)) {
+    return { canCancel: false, reason: "Only upcoming bookings can be cancelled.", booking: { id: booking.id, status } }
+  }
+  const held = roundMoney(booking.paidAmount ?? booking.payableAmount)
+  const policy = computeCancellationRefund({ payableAmount: held, startsAt: booking.startsAt })
+  let paidOnline = false
+  let onlineMethod = null
+  if (isRazorpayConfigured()) {
+    await ensurePaymentsSchema()
+    const { rows } = await pool.query(`SELECT payment_method FROM razorpay_payments WHERE booking_id = $1 AND fulfillment = 'BOOKED'`, [booking.id])
+    paidOnline = Boolean(rows[0])
+    onlineMethod = rows[0]?.payment_method ?? null
+  }
+  return {
+    canCancel: true,
+    booking: {
+      id: booking.id,
+      status,
+      customer: booking.customer,
+      service: booking.service,
+      startsAt: booking.startsAt,
+      payableAmount: booking.payableAmount,
+      heldAmount: held,
+    },
+    paidOnline,
+    onlineMethod,
+    policy: policy.canCancel
+      ? { percent: policy.refundPercent, tierLabel: policy.tierLabel, key: policy.policyKey }
+      : { percent: 0, tierLabel: policy.reason ?? "Appointment time has passed", key: "NONE" },
+    options: [0, 25, 50, 75, 100],
+  }
+}
+
 export async function updateReceptionBookingLifecycle({ bookingId, payload, actorUserId, publishEvent, publishPaymentEvent }) {
   const action = `${payload?.action ?? ""}`.trim().toLowerCase()
   if (!bookingId || !action) throw Object.assign(new Error("bookingId and action are required"), { code: "BAD_REQUEST" })
@@ -1108,7 +1256,7 @@ export async function updateReceptionBookingLifecycle({ bookingId, payload, acto
   if (action === "cancel") {
     // Same tiered refund policy as a customer's own cancellation (100%/50%/0% by
     // time-to-appointment), applied atomically, and the customer is told.
-    updated = await cancelBookingAsStaff({ bookingId, actorUserId, publishEvent: null, publishPaymentEvent })
+    updated = await cancelBookingAsStaff({ bookingId, actorUserId, publishEvent: null, publishPaymentEvent, refundPercent: payload?.refundPercent ?? null })
   } else if (action === "complete") {
     // Only the assigned stylist can complete service (see completeStylistBooking) —
     // that path also computes overtime/penalty from the real start time and triggers
@@ -1188,8 +1336,9 @@ export async function getCustomerCancellationPreview({ bookingId, actorUser }) {
  *
  * @param {{ bookingId: string, actorUserId: string, authorize?: (booking: object) => void }} params
  */
-async function cancelBookingWithRefund({ bookingId, actorUserId, authorize, auditAction = null }) {
-  return withTransaction(async client => {
+async function cancelBookingWithRefund({ bookingId, actorUserId, authorize, auditAction = null, refundPercentOverride = null }) {
+  if (isRazorpayConfigured()) await ensurePaymentsSchema()
+  const result = await withTransaction(async client => {
     const locked = await getBookingForUpdate(client, bookingId)
     if (!locked) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
     const booking = await getBookingById(bookingId, client)
@@ -1198,10 +1347,32 @@ async function cancelBookingWithRefund({ bookingId, actorUserId, authorize, audi
     if (!canTransitionBookingStatus(status, "CANCELLED")) {
       throw Object.assign(new Error("This booking cannot be cancelled"), { code: "INVALID_TRANSITION" })
     }
-    const refundPreview = computeCancellationRefund({
-      payableAmount: booking.payableAmount,
-      startsAt: booking.startsAt,
-    })
+    let refundPreview
+    if (refundPercentOverride !== null && refundPercentOverride !== undefined && `${refundPercentOverride}` !== "") {
+      // Reception decides how much goes back. It is a percentage of what the salon actually holds for this
+      // booking (collected minus already refunded), so it can never refund more than was paid.
+      const percent = Number(refundPercentOverride)
+      if (!Number.isInteger(percent) || percent < 0 || percent > 100) {
+        throw Object.assign(new Error("Refund percentage must be a whole number from 0 to 100"), { code: "BAD_REQUEST" })
+      }
+      const held = roundMoney(booking.paidAmount ?? booking.payableAmount)
+      const refundAmount = roundMoney((held * percent) / 100)
+      refundPreview = {
+        canCancel: true,
+        refundPercent: percent,
+        refundAmount,
+        retainedAmount: roundMoney(held - refundAmount),
+        payableAmount: held,
+        policyKey: "RECEPTION_CHOICE",
+        tierLabel: "Chosen by reception",
+        stylistFreedImmediately: true,
+      }
+    } else {
+      refundPreview = computeCancellationRefund({
+        payableAmount: booking.payableAmount,
+        startsAt: booking.startsAt,
+      })
+    }
     if (!refundPreview.canCancel) {
       throw Object.assign(new Error(refundPreview.reason ?? "Cannot cancel this booking"), { code: "BAD_REQUEST" })
     }
@@ -1219,7 +1390,7 @@ async function cancelBookingWithRefund({ bookingId, actorUserId, authorize, audi
         performedBy: actorUserId,
         resourceId: bookingId,
         originalValue: { status },
-        newValue: { status: "CANCELLED", refundAmount: refundPreview.refundAmount },
+        newValue: { status: "CANCELLED", refundAmount: refundPreview.refundAmount, refundPercent: refundPreview.refundPercent, refundBasis: refundPreview.policyKey },
       })
     }
     let refundPaymentId = null
@@ -1237,8 +1408,28 @@ async function cancelBookingWithRefund({ bookingId, actorUserId, authorize, audi
       })
       refundPaymentId = inserted?.id ?? null
     }
-    return { booking, refundPreview, refundPaymentId }
+    // Paid through Razorpay: owe the customer the policy amount at the gateway. Recorded in this
+    // transaction so a cancelled booking can never exist without its refund being queued.
+    let gatewayRefundRowId = null
+    if (refundPreview.refundAmount > 0 && isRazorpayConfigured()) {
+      const { rows } = await client.query(
+        `UPDATE razorpay_payments SET cancel_refund_paise = LEAST($2::bigint, amount_paise), cancel_refund_status = 'PENDING', updated_at = NOW()
+         WHERE booking_id = $1 AND fulfillment = 'BOOKED' AND cancel_refund_status IS NULL RETURNING id`,
+        [booking.id, Math.round(refundPreview.refundAmount * 100)]
+      )
+      gatewayRefundRowId = rows[0]?.id ?? null
+    }
+    return { booking, refundPreview, refundPaymentId, gatewayRefundRowId }
   })
+  // After commit: send the refund to Razorpay. If this fails the row stays PENDING and the sweep retries.
+  let gatewayRefund = null
+  if (result.gatewayRefundRowId) {
+    gatewayRefund = await initiateCancellationRefund(result.gatewayRefundRowId).catch(error => {
+      console.error("cancel_refund_initiation_failed", { bookingId, error: error?.code ?? error?.message ?? "error" })
+      return null
+    })
+  }
+  return { ...result, gatewayRefund, gatewayRefundQueued: Boolean(result.gatewayRefundRowId) }
 }
 
 async function publishRefundPayment(refundPaymentId, publishPaymentEvent) {
@@ -1249,7 +1440,7 @@ async function publishRefundPayment(refundPaymentId, publishPaymentEvent) {
 }
 
 export async function cancelCustomerBooking({ bookingId, actorUser, publishEvent, publishPaymentEvent }) {
-  const { booking, refundPreview, refundPaymentId } = await cancelBookingWithRefund({
+  const { booking, refundPreview, refundPaymentId, gatewayRefund, gatewayRefundQueued } = await cancelBookingWithRefund({
     bookingId,
     actorUserId: actorUser.id,
     authorize: current => {
@@ -1292,6 +1483,7 @@ export async function cancelCustomerBooking({ bookingId, actorUser, publishEvent
       amount: refundPreview.refundAmount,
       retainedAmount: refundPreview.retainedAmount,
       credited: Boolean(refundPayment),
+      gatewayRefund: gatewayRefundQueued ? (gatewayRefund ? "INITIATED" : "PENDING") : null,
       message:
         refundPreview.refundAmount > 0
           ? `Rs ${refundPreview.refundAmount.toFixed(2)} (${refundPreview.refundPercent}% refund) will be credited to your original payment method.`

@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Razorpay checkout harness (test mode)</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; max-width: 760px; margin: 24px auto; padding: 0 16px; }
+    button { padding: 8px 14px; margin: 4px 4px 4px 0; cursor: pointer; }
+    pre { background: #f4f4f5; padding: 10px; border-radius: 6px; max-height: 320px; overflow: auto; white-space: pre-wrap; }
+    .row { margin: 8px 0; } label { margin-right: 14px; }
+    #banner { padding: 10px; border-radius: 6px; margin: 10px 0; background: #eee; font-weight: 600; }
+    .ok { background: #dcfce7 !important; } .bad { background: #fee2e2 !important; } .wait { background: #fef9c3 !important; }
+  </style>
+</head>
+<body>
+  <h2>Razorpay checkout harness <small>(TEST mode, throwaway customer)</small></h2>
+  <div class="row"><button id="setup">1. Create test customer + session</button> <span id="who"></span></div>
+  <div class="row">Day: <select id="day"><option value="1">tomorrow</option><option value="0">today</option></select> Slot: <select id="slot"></select> <button id="reload">reload slots</button></div>
+  <div class="row">
+    <label><input type="checkbox" id="delayVerify" /> delay the verify call by 10s (race with webhook / reload)</label>
+    <label><input type="checkbox" id="dropVerify" /> drop the verify call (simulate network loss after paying)</label>
+  </div>
+  <div class="row"><button id="pay" disabled>2. Pay &amp; book</button> <button id="pay2" disabled>double-click test (2 calls at once)</button> <button id="resume" disabled>resume pending (after reload)</button> <button id="cancelBooking" disabled>cancel last confirmed booking</button></div>
+  <div id="banner">idle</div>
+  <pre id="log"></pre>
+  <div class="row"><button id="teardown">Delete test data</button></div>
+
+  <script type="module">
+    import { runRazorpayPayment, pollPaymentStatus, readPendingPayment, clearPendingPayment, isTerminalState } from "/razorpay-checkout.js";
+    const $ = (id) => document.getElementById(id);
+    const log = (...a) => { $("log").textContent += a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ") + "\n"; $("log").scrollTop = 1e9; };
+    const banner = (text, cls) => { $("banner").textContent = text; $("banner").className = cls ?? ""; };
+    let ctx = null;
+    window.__result = null;
+
+    const request = async (path, init = {}) => {
+      if (path.endsWith("/verify")) {
+        if ($("dropVerify").checked) { log("[harness] DROPPING verify request (network loss)"); throw new Error("network down"); }
+        if ($("delayVerify").checked) { log("[harness] delaying verify by 10s"); await new Promise((r) => setTimeout(r, 10000)); }
+      }
+      log("->", init.method ?? "GET", path);
+      return fetch(ctx.api + path, { ...init, credentials: "include", headers: { "Content-Type": "application/json", ...(init.headers ?? {}) } });
+    };
+
+    async function loadSlots() {
+      const day = new Date(Date.now() + Number($("day").value) * 24 * 3600 * 1000).toISOString().slice(0, 10);
+      const res = await request(`/api/customer/slots?serviceIds=${ctx.service.id}&date=${day}`);
+      const data = await res.json();
+      const free = (data.slots ?? []).filter((s) => s.stylists?.length);
+      $("slot").innerHTML = free.map((s, i) => `<option value="${i}" data-starts="${s.startsAt}" data-stylist="${s.stylists[0].id}">${s.startsAt}</option>`).join("");
+      log("slots loaded:", free.length);
+    }
+
+    $("setup").onclick = async () => {
+      ctx = await (await fetch("/setup", { method: "POST" })).json();
+      $("who").textContent = `user ${ctx.userId.slice(0, 8)} / service ${ctx.service.name} ₹${ctx.service.base_price}`;
+      await loadSlots();
+      ["pay", "pay2", "resume", "cancelBooking"].forEach((id) => ($(id).disabled = false));
+      banner("ready", "");
+    };
+    $("reload").onclick = loadSlots;
+    $("day").onchange = loadSlots;
+    $("cancelBooking").onclick = async () => {
+      const id = window.__result?.status?.bookingId;
+      if (!id) return log("no confirmed booking to cancel");
+      const prev = await (await request(`/api/customer/bookings/${id}/cancellation-preview`)).json();
+      log("PREVIEW", prev.preview);
+      const res = await request(`/api/customer/bookings/${id}/cancel`, { method: "POST" });
+      const data = await res.json();
+      window.__cancel = { status: res.status, preview: prev.preview, data };
+      log("CANCEL", res.status, data.refund ?? data);
+      banner(`cancelled: ${data.refund?.message ?? data.error}`, res.ok ? "ok" : "bad");
+    };
+    $("teardown").onclick = async () => { log("teardown:", await (await fetch("/teardown", { method: "POST" })).json()); ctx = null; };
+
+    function payload() {
+      const opt = $("slot").selectedOptions[0];
+      return { serviceIds: [ctx.service.id], startsAt: opt.dataset.starts, stylistId: opt.dataset.stylist };
+    }
+    let busy = false;
+    async function pay() {
+      if (busy) { log("[harness] click ignored: a payment is already in progress (same guard the page uses)"); return null; }
+      busy = true; window.__result = null;
+      try {
+        banner("starting…", "wait");
+        const result = await runRazorpayPayment({ request, payload: payload(), onPhase: (p) => { log("phase:", p); banner("phase: " + p, "wait"); } });
+        log("RESULT", result);
+        window.__result = result;
+        await settle(result.status);
+        return result;
+      } catch (e) {
+        log("START ERROR", e); banner("could not start: " + (e?.message ?? e), "bad"); window.__result = { error: e };
+      } finally { busy = false; }
+    }
+    async function settle(status) {
+      if (!status) return;
+      if (!isTerminalState(status.state)) {
+        banner("processing — booking NOT confirmed yet", "wait");
+        status = await pollPaymentStatus(request, status.orderId, { intervalMs: 2000, timeoutMs: 60000, onUpdate: (s) => log("poll:", s.state) }) ?? status;
+        window.__result = { ...(window.__result ?? {}), status };
+      }
+      const cls = status.state === "CONFIRMED" ? "ok" : ["FAILED", "EXPIRED", "REFUNDING", "REFUNDED"].includes(status.state) ? "bad" : "wait";
+      banner(`${status.state}: ${status.message}`, cls);
+      log("FINAL", status);
+      if (isTerminalState(status.state)) clearPendingPayment();
+    }
+    $("pay").onclick = pay;
+    $("pay2").onclick = () => { pay(); pay(); };
+    $("resume").onclick = async () => {
+      const p = readPendingPayment();
+      if (!p) return log("nothing pending");
+      log("resuming", p.orderId);
+      const status = await pollPaymentStatus(request, p.orderId, { intervalMs: 2000, timeoutMs: 60000, onUpdate: (s) => log("poll:", s.state) });
+      window.__result = { status };
+      await settle(status);
+    };
+  </script>
+</body>
+</html>

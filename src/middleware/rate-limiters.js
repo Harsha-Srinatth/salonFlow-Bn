@@ -135,3 +135,20 @@ export const queueLiveRateLimit = createLimiter({
   windowMs: Number(process.env.RATE_QUEUE_LIVE_WINDOW_MS ?? 60 * 1000),
   limit: Number(process.env.RATE_QUEUE_LIVE_MAX ?? 240),
 })
+
+/**
+ * Razorpay order creation: each call can hit the Razorpay API, so it is capped per customer
+ * (falls back to IP). Re-clicking Pay is already deduplicated server-side; this stops abuse.
+ */
+export const paymentCreateRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_PAYMENT_CREATE_WINDOW_MS ?? 60 * 1000),
+  limit: Number(process.env.RATE_PAYMENT_CREATE_MAX ?? 20),
+  keyGenerator: req => req.appUser?.id ?? req.ip,
+})
+
+/** Razorpay verify / status polling / checkout events. The status page polls every few seconds. */
+export const paymentStatusRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_PAYMENT_STATUS_WINDOW_MS ?? 60 * 1000),
+  limit: Number(process.env.RATE_PAYMENT_STATUS_MAX ?? 120),
+  keyGenerator: req => req.appUser?.id ?? req.ip,
+})

@@ -11,6 +11,7 @@ import {
   listReceptionOffersController,
   listReceptionStylistsController,
   updateReceptionBookingController,
+  getReceptionCancellationPreviewController,
 } from "../bookings/controller.js"
 import { ensureBookingsSchema } from "../bookings/schema-init.js"
 import { ensureMembershipSchema } from "../membership/service.js"
@@ -51,6 +52,7 @@ router.get("/services", receptionBookingsListRateLimit, listBookableServicesCont
 router.get("/slots", receptionBookingsListRateLimit, listAvailableSlotsController)
 router.get("/queue", receptionBookingsListRateLimit, listQueueController)
 router.get("/queue/live", queueLiveRateLimit, getOperationalQueueBoardController)
+router.get("/bookings/:id/cancellation-preview", receptionBookingsListRateLimit, getReceptionCancellationPreviewController)
 router.patch("/bookings/:id", receptionBookingsCreateRateLimit, (req, res) =>
   updateReceptionBookingController(req, res, { publishEvent: publishBookingEvent, publishPaymentEvent })
 )

@@ -15,6 +15,7 @@ import adminRoutes from "./routes/admin.js"
 import authRoutes from "./routes/auth.js"
 import customerRoutes from "./routes/customer.js"
 import notificationRoutes from "./routes/notifications.js"
+import paymentRoutes, { razorpayWebhookHandler } from "./routes/payments.js"
 import receptionRoutes from "./routes/reception.js"
 import staffRoutes from "./routes/staff.js"
 
@@ -35,6 +36,8 @@ import { ensureQueueSchema } from "./queue/schema-init.js"
 import { ensureUserProfileSchema } from "./auth/schema-init.js"
 import { broadcastQueueSnapshot, runQueueReminderSweep } from "./queue/service.js"
 import { ensureLoyaltySchema, runReferralSettlementSweep } from "./loyalty/service.js"
+import { isRazorpayConfigured, razorpayConfig } from "./payments/config.js"
+import { ensurePaymentsRuntime, runRazorpaySweep } from "./payments/service.js"
 
 assertProductionEnv()
 
@@ -117,6 +120,10 @@ app.use(
 
 // Service photos arrive as base64 inside JSON (the route allows 8 MB of image, ~11 MB encoded);
 // everything else keeps a small cap so a large body cannot be used to burn memory.
+// Razorpay signs the exact bytes it sends, so its webhook gets the raw body (no JSON parsing)
+// and must be registered before the global JSON parser below.
+app.post("/api/payments/razorpay/webhook", express.raw({ type: "*/*", limit: "256kb" }), attachRequestId, razorpayWebhookHandler)
+
 app.use("/api/admin/services/upload-image", express.json({ limit: "12mb" }))
 app.use(express.json({ limit: "256kb" }))
 app.use(cookieParser())
@@ -147,6 +154,7 @@ app.get("/ready", async (_req, res) => {
 app.use("/api/auth", authRoutes)
 app.use("/api/admin", adminRoutes)
 app.use("/api/customer", customerRoutes)
+app.use("/api/payments", paymentRoutes)
 app.use("/api/reception", receptionRoutes)
 app.use("/api/staff", staffRoutes)
 app.use("/api/notifications", notificationRoutes)
@@ -290,8 +298,29 @@ try {
   await ensureBookingsSchema()
   await ensureQueueSchema()
   await ensureLoyaltySchema()
+  if (isRazorpayConfigured()) await ensurePaymentsRuntime()
 } catch (error) {
   console.error("queue_schema_bootstrap_failed", error)
+}
+
+if (isRazorpayConfigured()) {
+  console.log("razorpay_enabled", { mode: razorpayConfig().mode, webhookSecretConfigured: Boolean(razorpayConfig().webhookSecret) })
+  // Reconciles open/late payments with Razorpay, expires truly unpaid checkouts, retries refunds.
+  // Safe on every instance (all state changes are row-locked / conditional); the Redis slot just
+  // avoids N instances asking Razorpay the same thing.
+  const razorpaySweepIntervalMs = Number(process.env.RAZORPAY_SWEEP_INTERVAL_MS ?? 60_000)
+  let razorpaySweepRunning = false
+  setInterval(async () => {
+    if (razorpaySweepRunning || shuttingDown) return
+    razorpaySweepRunning = true
+    try {
+      if (await tryAcquireSlot("sahasra:payments:razorpay-sweep", Math.max(1000, Math.round(razorpaySweepIntervalMs * 0.9)))) await runRazorpaySweep()
+    } catch (error) {
+      console.error("razorpay_sweep_failed", error)
+    } finally {
+      razorpaySweepRunning = false
+    }
+  }, razorpaySweepIntervalMs)
 }
 
 setInterval(() => {
