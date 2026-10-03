@@ -45,6 +45,7 @@ import {
   staffSetPasswordRateLimit,
 } from "../middleware/rate-limiters.js"
 import bcrypt from "bcryptjs"
+import { isSessionTokenLive } from "../middleware/auth.js"
 import { signStaffAccessToken, signStaffSetupToken, verifyStaffAccessToken, verifyStaffSetupToken } from "../lib/tokens.js"
 import { verifyFirebaseToken } from "../lib/firebase-admin.js"
 const isProduction = process.env.NODE_ENV === "production"
@@ -154,7 +155,7 @@ function describeRegistrationVerificationFailure(firebase, requestedPhone) {
 async function getDbUserById(id) {
   const { rows } = await pool.query(
     `
-      SELECT ${USER_PROFILE_COLUMNS}
+      SELECT ${USER_PROFILE_COLUMNS}, staff_session_jti, app_session_epoch
       FROM users
       WHERE id = $1
       LIMIT 1
@@ -174,7 +175,8 @@ async function getDbUserFromSessionToken(token) {
   if (!token) return null
   try {
     const payload = await verifyStaffAccessToken(token)
-    return getDbUserById(payload.sub)
+    const user = await getDbUserById(payload.sub)
+    return isSessionTokenLive(payload, user) ? user : null
   } catch {
     return null
   }
@@ -492,7 +494,8 @@ async function handleAppLogin(req, res) {
     return res.status(401).json({ error: "Invalid credentials" })
   }
   clearPasswordLoginFailures(ip, normalizedEmail)
-  const accessToken = await signStaffAccessToken(user.id)
+  const { rows: epochRows } = await pool.query("SELECT app_session_epoch FROM users WHERE id = $1", [user.id])
+  const accessToken = await signStaffAccessToken(user.id, undefined, { sessionEpoch: Number(epochRows[0]?.app_session_epoch ?? 0) })
   auditAuthAsync("auth", "login_success", {
     ip,
     userId: user.id,
@@ -539,7 +542,19 @@ async function handleMe(req, res) {
 async function handleLogout(req, res) {
   const token = req.cookies?.app_access_token
   if (token) {
-    // Stateless cookie: clearing it below is the whole logout for customers/admins.
+    // Revoke server-side too: bump the epoch this cookie was issued under, so a copy of the
+    // cookie (another tab, a stolen value) stops working, not just the one in this browser.
+    try {
+      const payload = await verifyStaffAccessToken(token)
+      if (payload?.sub && !payload.jti) {
+        await pool.query(
+          "UPDATE users SET app_session_epoch = app_session_epoch + 1 WHERE id = $1 AND app_session_epoch = $2",
+          [payload.sub, Number(payload.sv ?? 0)]
+        )
+      }
+    } catch {
+      // Expired/invalid cookie: nothing to revoke.
+    }
   }
   res.cookie("app_access_token", "", {
     maxAge: 0,

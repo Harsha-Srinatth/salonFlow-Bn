@@ -38,6 +38,12 @@ import { ensureQueueSchema } from "../queue/schema-init.js"
 import { queueLiveRateLimit } from "../middleware/rate-limiters.js"
 import { publishOfferEvent, publishServiceCatalogEvent } from "../realtime/socket-gateway.js"
 import adminBookingRoutes from "./admin-bookings.js"
+import { ensureBusinessSchema, getAdminBusinessProfile, updateBusinessProfile } from "../business/service.js"
+import { ensureAgentSchema, getAgentUsageSummary } from "../agents/agent-log.js"
+import { isLlmConfigured, AGENT_MODEL } from "../agents/llm.js"
+import { AGENTS, SERVICE_CONTENT_AGENT } from "../agents/registry.js"
+import { draftServiceContent, runConversationalAgent } from "../agents/runner.js"
+import { assistantBurstRateLimit, assistantDailyRateLimit } from "../middleware/rate-limiters.js"
 
 const router = express.Router()
 const OFFER_SEGMENTS = ["FREE", "BASIC", "PREMIUM"]
@@ -567,6 +573,49 @@ router.post("/staff/:id/leaves", createStaffLeaveController)
 router.delete("/staff/:id", async (req, res) => {
   await pool.query("DELETE FROM users WHERE id = $1 AND role IN ('STAFF', 'RECEPTIONIST')", [req.params.id])
   return res.json({ success: true })
+})
+
+router.get("/business-profile", async (_req, res) => {
+  await ensureBusinessSchema()
+  res.json(await getAdminBusinessProfile())
+})
+
+router.put("/business-profile", async (req, res) => {
+  try {
+    res.json(await updateBusinessProfile({ payload: req.body ?? {}, actorUserId: req.appUser.id }))
+  } catch (error) {
+    if (error?.code === "BAD_REQUEST") return res.status(400).json({ error: error.message })
+    throw error
+  }
+})
+
+// --- AI agents (admin) -------------------------------------------------------------------
+router.get("/agents", async (_req, res) => {
+  await ensureAgentSchema()
+  res.json({
+    llmConfigured: isLlmConfigured(),
+    model: isLlmConfigured() ? AGENT_MODEL : null,
+    agents: [...Object.values(AGENTS), SERVICE_CONTENT_AGENT].map(agent => ({
+      id: agent.id,
+      responsibility: agent.responsibility,
+      scopes: agent.scopes,
+      tools: agent.tools ?? [],
+    })),
+    usageLast7Days: await getAgentUsageSummary({ days: 7 }),
+  })
+})
+
+router.post("/agents/insights", assistantBurstRateLimit, assistantDailyRateLimit, async (req, res) => {
+  await ensureAgentSchema()
+  res.set("Cache-Control", "no-store")
+  res.json(await runConversationalAgent({ agentId: "admin-insights", appUser: req.appUser, conversation: req.body?.messages }))
+})
+
+router.post("/agents/service-content/:id", assistantBurstRateLimit, assistantDailyRateLimit, async (req, res) => {
+  await ensureAgentSchema()
+  const serviceId = `${req.params.id ?? ""}`.trim()
+  res.set("Cache-Control", "no-store")
+  res.json(await draftServiceContent({ serviceId, appUser: req.appUser, instructions: req.body?.instructions }))
 })
 
 router.get("/salons", async (_req, res) => {

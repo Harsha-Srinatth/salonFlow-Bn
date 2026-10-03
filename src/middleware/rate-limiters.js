@@ -152,3 +152,32 @@ export const paymentStatusRateLimit = createLimiter({
   limit: Number(process.env.RATE_PAYMENT_STATUS_MAX ?? 120),
   keyGenerator: req => req.appUser?.id ?? req.ip,
 })
+
+/** Public, unauthenticated business info (landing page footer). Cached server-side; cap scrapers. */
+export const publicInfoRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_PUBLIC_INFO_WINDOW_MS ?? 60 * 1000),
+  limit: Number(process.env.RATE_PUBLIC_INFO_MAX ?? 120),
+})
+
+/**
+ * AI assistant turns. Each one can cost a paid model call, so there are two ceilings: a short
+ * burst window and a daily budget. Signed-in callers are keyed by user (a shared office IP does
+ * not starve everyone); anonymous visitors by IP with a lower allowance.
+ */
+const assistantKey = req => (req.appUser?.id ? `u:${req.appUser.id}` : `ip:${req.ip}`)
+export const assistantBurstRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_ASSISTANT_WINDOW_MS ?? 60 * 1000),
+  limit: req => (req.appUser ? Number(process.env.RATE_ASSISTANT_MAX ?? 12) : Number(process.env.RATE_ASSISTANT_PUBLIC_MAX ?? 6)),
+  keyGenerator: assistantKey,
+})
+export const assistantDailyRateLimit = createLimiter({
+  windowMs: 24 * 60 * 60 * 1000,
+  limit: req =>
+    req.appUser ? Number(process.env.RATE_ASSISTANT_DAILY_MAX ?? 150) : Number(process.env.RATE_ASSISTANT_PUBLIC_DAILY_MAX ?? 40),
+  keyGenerator: assistantKey,
+})
+/** Coarse per-IP ceiling applied before authentication, so a flood never reaches token verification. */
+export const assistantIpRateLimit = createLimiter({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.RATE_ASSISTANT_IP_MAX ?? 60),
+})

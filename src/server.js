@@ -18,6 +18,8 @@ import notificationRoutes from "./routes/notifications.js"
 import paymentRoutes, { razorpayWebhookHandler } from "./routes/payments.js"
 import receptionRoutes from "./routes/reception.js"
 import staffRoutes from "./routes/staff.js"
+import publicRoutes from "./routes/public.js"
+import assistantRoutes from "./routes/assistant.js"
 
 import {
   initSocketGateway,
@@ -49,13 +51,18 @@ const app = express()
 const port = Number(process.env.PORT || 18081)
 const host = "0.0.0.0"
 
-const allowedOrigins = [
-  "http://localhost:5173",
-  "http://localhost:5178",
-  "http://127.0.0.1:5173",
-  "http://127.0.0.1:5178",
-  "https://salonflow-eta.vercel.app",
-]
+// Local dev servers are only trusted outside production: with `credentials: true`, any page
+// served from a developer's localhost could otherwise call the production API as the user.
+const allowedOrigins = process.env.NODE_ENV === "production"
+  ? ["https://salonflow-eta.vercel.app"]
+  : [
+      "http://localhost:5173",
+      "http://localhost:5178",
+      "http://localhost:55000",
+      "http://127.0.0.1:5173",
+      "http://127.0.0.1:5178",
+      "https://salonflow-eta.vercel.app",
+    ]
 
 // Allow additional origins from env
 if (process.env.FRONTEND_ORIGIN) {
@@ -158,6 +165,8 @@ app.use("/api/payments", paymentRoutes)
 app.use("/api/reception", receptionRoutes)
 app.use("/api/staff", staffRoutes)
 app.use("/api/notifications", notificationRoutes)
+app.use("/api/public", publicRoutes)
+app.use("/api/assistant", assistantRoutes)
 
 // Postgres errors that mean "the client sent something malformed" rather than
 // "the server broke": invalid uuid/number/timestamp text, out-of-range values.
@@ -172,7 +181,7 @@ app.use((err, req, res, next) => {
     status = err?.code === "23505" ? 409 : CLIENT_INPUT_PG_CODES.has(err?.code) ? 400 : 500
   }
 
-  if (status >= 500) {
+  if (status >= 500 && err?.expose !== true) {
     console.error("request_failed", {
       requestId: req.requestId,
       method: req.method,
@@ -187,8 +196,10 @@ app.use((err, req, res, next) => {
     409: "That already exists",
     413: "Request body too large",
   }
+  // `expose` marks errors whose message was written for the end user (validation, "not configured").
+  const exposed = err?.expose === true && typeof err.message === "string" && err.message
   res.status(status).json({
-    error: status >= 500 ? "Internal server error" : messages[status] ?? "Request failed",
+    error: exposed ? err.message : status >= 500 ? "Internal server error" : messages[status] ?? "Request failed",
     requestId: req.requestId,
   })
 })

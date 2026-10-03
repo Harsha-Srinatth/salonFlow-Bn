@@ -37,6 +37,11 @@ export function assertProductionEnv(env = process.env) {
   if (!`${env.QUEUE_TICKET_SECRET ?? env.JWT_SECRET ?? ""}`.trim()) {
     problems.push("QUEUE_TICKET_SECRET (or JWT_SECRET) is not set")
   }
+  if (!`${env.ANTHROPIC_API_KEY ?? ""}`.trim()) {
+    console.warn("env_check_warning", {
+      message: "ANTHROPIC_API_KEY is unset: the support assistant runs in basic (rule-based) mode and admin AI tools are disabled.",
+    })
+  }
   if (!`${env.TRUST_PROXY ?? ""}`.trim()) {
     console.warn("env_check_warning", {
       message: "TRUST_PROXY is unset: behind a load balancer every client will share one IP for rate limiting.",

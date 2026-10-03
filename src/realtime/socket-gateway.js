@@ -4,6 +4,7 @@ import Redis from "ioredis"
 import { verifyFirebaseToken } from "../lib/firebase-admin.js"
 import { pool } from "../lib/db-pool.js"
 import { verifyStaffAccessToken } from "../lib/tokens.js"
+import { isSessionTokenLive } from "../middleware/auth.js"
 import { QUEUE_LIVE_ROOM, QUEUE_SNAPSHOT_EVENT } from "../queue/constants.js"
 import { getSocketClientIp } from "../lib/client-ip.js"
 import { markQueueMutated } from "../queue/cache-hooks.js"
@@ -42,7 +43,7 @@ async function resolveUserFromToken(token) {
     const staffPayload = await verifyStaffAccessToken(token)
     const { rows } = await pool.query(
       `
-        SELECT id, role, email, phone, staff_session_jti
+        SELECT id, role, email, phone, staff_session_jti, app_session_epoch
         FROM users
         WHERE id = $1
         LIMIT 1
@@ -52,7 +53,7 @@ async function resolveUserFromToken(token) {
     const row = rows[0] ?? null
     // A staff cookie carries a session id; once it is replaced or revoked (new login, logout)
     // the old cookie must not keep a live socket either.
-    if (row && staffPayload.jti && staffPayload.jti !== row.staff_session_jti) return null
+    if (row && !isSessionTokenLive(staffPayload, row)) return null
     return row
   } catch {
     try {

@@ -95,6 +95,9 @@ export const ensureBookingsSchema = createSchemaEnsurer({
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS image_url TEXT`)
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS variants_json JSONB NOT NULL DEFAULT '[]'::jsonb`)
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS created_by UUID REFERENCES users(id) ON DELETE SET NULL`)
+    // Long-form "service details" sections and extra photos (see bookings/service-details.js).
+    await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS details_json JSONB NOT NULL DEFAULT '{}'::jsonb`)
+    await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS gallery_json JSONB NOT NULL DEFAULT '[]'::jsonb`)
     // The customer catalog is `WHERE is_active ORDER BY name`; a partial index serves it without a sort.
     await client.query(`CREATE INDEX IF NOT EXISTS service_catalog_active_name_idx ON service_catalog (name) WHERE is_active = TRUE`)
     await client.query(`CREATE INDEX IF NOT EXISTS service_catalog_category_idx ON service_catalog (category)`)

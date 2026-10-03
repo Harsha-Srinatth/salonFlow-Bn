@@ -63,7 +63,7 @@ async function findDbUserById(id) {
   if (!id) return null
   const { rows } = await pool.query(
     `
-      SELECT ${USER_PROFILE_COLUMNS}, staff_session_jti
+      SELECT ${USER_PROFILE_COLUMNS}, staff_session_jti, app_session_epoch
       FROM users
       WHERE id = $1
       LIMIT 1
@@ -75,6 +75,19 @@ async function findDbUserById(id) {
 
 /** Maps a DB row to the shape exposed on `req.appUser`. @see lib/user-dto.js */
 const toAppUser = toAppUserDto
+
+/**
+ * Is this cookie session still live? Staff/reception tokens carry a session id (`jti`) that must
+ * match the one stored at their latest login (logout clears it). App tokens carry the user's
+ * session epoch (`sv`, missing = 0 for cookies issued before epochs existed); logout increments
+ * the epoch. Checked on every route, not only the staff portal: a revoked cookie used to keep
+ * working on shared routes such as notifications.
+ */
+export function isSessionTokenLive(payload, user) {
+  if (!payload || !user) return false
+  if (payload.jti) return payload.jti === user.staff_session_jti
+  return Number(payload.sv ?? 0) === Number(user.app_session_epoch ?? 0)
+}
 
 /**
  * Express middleware: authenticate either (1) existing staff/app cookie JWT, or (2) `Authorization: Bearer` Firebase ID token.
@@ -93,7 +106,8 @@ async function resolveAppUserFromSessionCookie(sessionToken, { requireActiveSess
     // The session id lives in the database (not process memory), so this holds across
     // restarts and across several instances. Tokens without an id predate this check and
     // are refused: those users simply sign in again once.
-    if (requireActiveSession && (!payload.jti || payload.jti !== user.staff_session_jti)) return null
+    if (requireActiveSession && !payload.jti) return null
+    if (!isSessionTokenLive(payload, user)) return null
     return toAppUser(user)
   } catch {
     return null
@@ -207,4 +221,29 @@ export function requireAnyAppRole(roles) {
       res.status(403).json({ error: "Forbidden" })
     }
   }
+}
+
+/**
+ * For endpoints that work for guests *and* signed-in users (the support assistant): sets
+ * `req.appUser` when the caller presents a valid, live session cookie or Firebase token, and
+ * otherwise continues as a guest. It never rejects: a stale credential simply means fewer
+ * privileges, never more.
+ *
+ * @type {import("express").RequestHandler}
+ */
+export async function attachOptionalAppUser(req, _res, next) {
+  req.appUser = null
+  try {
+    const cookieToken = req.cookies?.app_access_token ?? req.cookies?.staff_access_token ?? null
+    let appUser = await resolveAppUserFromSessionCookie(cookieToken, { requireActiveSession: false })
+    if (!appUser) {
+      const auth = req.headers.authorization ?? ""
+      const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null
+      if (token) appUser = toAppUser(await findDbUserByFirebase(await verifyFirebaseToken(token)))
+    }
+    req.appUser = appUser ?? null
+  } catch {
+    req.appUser = null
+  }
+  next()
 }

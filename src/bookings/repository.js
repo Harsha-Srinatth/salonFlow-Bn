@@ -13,6 +13,7 @@ import { roundMoney } from "../lib/money.js"
 import { GENDER_UNSPECIFIED, normalizeCustomerGender } from "../lib/gender.js"
 import { decryptPiiText, encryptPiiText } from "../security/crypto-envelope.js"
 import { normalizeBookingStatus } from "./validators.js"
+import { buildServiceImageList } from "./service-details.js"
 
 const BOOKING_PAYMENT_AGG_COLUMNS = `
   COALESCE((
@@ -542,6 +543,9 @@ function toServiceDto(row) {
     duration: Number(row.duration_minutes ?? 45),
     description: row.description ?? "",
     image: row.image_url ?? "",
+    gallery: Array.isArray(row.gallery_json) ? row.gallery_json : [],
+    images: buildServiceImageList(row.image_url, row.gallery_json),
+    details: row.details_json && typeof row.details_json === "object" && !Array.isArray(row.details_json) ? row.details_json : {},
     variants: Array.isArray(row.variants_json) ? row.variants_json : [],
     discountPercent: Number(row.discount_percent ?? 0),
     isActive: Boolean(row.is_active),
@@ -561,7 +565,7 @@ export async function listServiceCatalog({ includeInactive = false } = {}) {
 async function loadServiceCatalog({ includeInactive = false } = {}) {
   const { rows } = await pool.query(
     `
-      SELECT id, name, category, target_gender, base_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active
+      SELECT id, name, category, target_gender, base_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active, details_json, gallery_json
       FROM service_catalog
       WHERE ($1::boolean = TRUE OR is_active = TRUE)
       ORDER BY name ASC
@@ -580,6 +584,8 @@ export async function createServiceCatalogItem({
   description,
   imageUrl,
   variants,
+  details,
+  gallery,
   createdBy,
 }) {
   const serviceId = uuid()
@@ -587,10 +593,10 @@ export async function createServiceCatalogItem({
     `
       INSERT INTO service_catalog (
         id, name, category, target_gender, base_price, duration_minutes,
-        description, image_url, variants_json, discount_percent, is_active, created_by
+        description, image_url, variants_json, discount_percent, is_active, created_by, details_json, gallery_json
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,0,TRUE,$10)
-      RETURNING id, name, category, target_gender, base_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,0,TRUE,$10,$11::jsonb,$12::jsonb)
+      RETURNING id, name, category, target_gender, base_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active, details_json, gallery_json
     `,
     [
       serviceId,
@@ -603,6 +609,8 @@ export async function createServiceCatalogItem({
       imageUrl || null,
       JSON.stringify(variants ?? []),
       createdBy,
+      JSON.stringify(details ?? {}),
+      JSON.stringify(gallery ?? []),
     ]
   )
   const service = rows[0]
@@ -623,6 +631,8 @@ export async function updateServiceCatalogItem({
   variants,
   discountPercent,
   isActive,
+  details,
+  gallery,
 }) {
   const { rows } = await pool.query(
     `
@@ -637,10 +647,12 @@ export async function updateServiceCatalogItem({
         image_url = $8,
         variants_json = $9::jsonb,
         discount_percent = COALESCE($10::numeric, discount_percent),
-        is_active = $11,
+        is_active = COALESCE($11::boolean, is_active),
+        details_json = COALESCE($12::jsonb, details_json),
+        gallery_json = COALESCE($13::jsonb, gallery_json),
         updated_at = NOW()
       WHERE id = $1
-      RETURNING id, name, category, target_gender, base_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active
+      RETURNING id, name, category, target_gender, base_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active, details_json, gallery_json
     `,
     [
       id,
@@ -653,7 +665,10 @@ export async function updateServiceCatalogItem({
       imageUrl || null,
       JSON.stringify(variants ?? []),
       discountPercent === undefined ? null : Number(discountPercent),
-      Boolean(isActive),
+      isActive === undefined ? null : Boolean(isActive),
+      // undefined = "not sent" (older admin clients): keep what is stored.
+      details === undefined ? null : JSON.stringify(details),
+      gallery === undefined ? null : JSON.stringify(gallery),
     ]
   )
   if (rows[0]) await invalidateCatalogCaches()

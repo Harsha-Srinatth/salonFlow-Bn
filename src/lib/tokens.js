@@ -13,8 +13,9 @@ const SETUP_SECRET = encoder.encode(process.env.STAFF_SETUP_SECRET ?? "staff-set
  * @param {string} userId Database user primary key
  * @returns {Promise<string>} Signed JWT
  */
-export async function signStaffAccessToken(userId, jti = undefined) {
-  const jwt = new SignJWT({})
+export async function signStaffAccessToken(userId, jti = undefined, { sessionEpoch } = {}) {
+  // `sv` (app logins only): the user's app_session_epoch at sign-in; logout bumps it.
+  const jwt = new SignJWT(Number.isInteger(sessionEpoch) ? { sv: sessionEpoch } : {})
   if (jti) jwt.setJti(jti)
   return jwt
     .setProtectedHeader({ alg: "HS256" })

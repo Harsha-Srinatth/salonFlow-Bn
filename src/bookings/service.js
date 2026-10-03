@@ -28,6 +28,7 @@ import {
   CUSTOMER_CANCELLATION_POLICY_RULES,
 } from "./cancellation-policy.js"
 import { canTransitionBookingStatus, normalizeBookingStatus, sanitizeBookingFilters } from "./validators.js"
+import { normalizeGallery, normalizeImageUrl, normalizeServiceDetails } from "./service-details.js"
 import {
   createServiceCatalogItem,
   createBooking,
@@ -68,11 +69,13 @@ import {
   lockStylistSchedule,
 } from "./repository.js"
 
-const SALON_OPEN_MINUTES = 8 * 60
-const SALON_CLOSE_MINUTES = 23 * 60
-const LUNCH_START_MINUTES = 13 * 60
-const LUNCH_END_MINUTES = 13 * 60 + 30
-const SLOT_STEP_MINUTES = 15
+import {
+  LUNCH_END_MINUTES,
+  LUNCH_START_MINUTES,
+  SALON_CLOSE_MINUTES,
+  SALON_OPEN_MINUTES,
+  SLOT_STEP_MINUTES,
+} from "./constants.js"
 const NOTIFY_TIMEZONE = process.env.SALON_TIMEZONE ?? "Asia/Kolkata"
 
 function formatNotifyDateTime(iso) {
@@ -574,7 +577,9 @@ export async function createAdminService({ payload, actorUserId }) {
   const basePrice = Number(payload?.basePrice ?? 0)
   const duration = Number(payload?.duration ?? 0)
   const description = `${payload?.description ?? ""}`.trim()
-  const image = `${payload?.image ?? ""}`.trim()
+  const image = normalizeImageUrl(payload?.image, "Service image")
+  const details = normalizeServiceDetails(payload?.details)
+  const gallery = normalizeGallery(payload?.gallery)
   const variantsRaw = Array.isArray(payload?.variants) ? payload.variants : []
   const variants = variantsRaw.map(item => ({
     name: `${item?.name ?? ""}`.trim(),
@@ -606,6 +611,8 @@ export async function createAdminService({ payload, actorUserId }) {
     description,
     imageUrl: image,
     variants,
+    details,
+    gallery,
     createdBy: actorUserId,
   })
   auditAuthAsync("auth", "admin_service_created", {
@@ -623,10 +630,13 @@ export async function updateAdminService({ serviceId, payload, actorUserId }) {
   const basePrice = Number(payload?.basePrice ?? 0)
   const duration = Number(payload?.duration ?? 0)
   const description = `${payload?.description ?? ""}`.trim()
-  const image = `${payload?.image ?? ""}`.trim()
+  const image = normalizeImageUrl(payload?.image, "Service image")
   const discountPercentRaw = payload?.discountPercent
   const discountPercent = discountPercentRaw === undefined ? undefined : Number(discountPercentRaw)
-  const isActive = Boolean(payload?.isActive)
+  // Omitted = keep the current state (a client that forgot the flag used to deactivate the service).
+  const isActive = payload?.isActive === undefined ? undefined : Boolean(payload.isActive)
+  const details = payload?.details === undefined ? undefined : normalizeServiceDetails(payload.details)
+  const gallery = payload?.gallery === undefined ? undefined : normalizeGallery(payload.gallery)
   const variantsRaw = Array.isArray(payload?.variants) ? payload.variants : []
   const variants = variantsRaw.map(item => ({
     name: `${item?.name ?? ""}`.trim(),
@@ -659,6 +669,8 @@ export async function updateAdminService({ serviceId, payload, actorUserId }) {
     variants,
     discountPercent,
     isActive,
+    details,
+    gallery,
   })
   if (!updated) throw Object.assign(new Error("Service not found"), { code: "NOT_FOUND" })
   auditAuthAsync("auth", "admin_service_updated", {
