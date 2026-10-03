@@ -68,7 +68,15 @@ router.delete("/bookings/:id", (req, res) =>
   removeCustomerBookingFromHistoryController(req, res, { publishEvent: publishBookingEvent })
 )
 router.get("/stylists", listReceptionStylistsController)
-router.get("/services", listBookableServicesController)
+// Changes only on an admin edit; let the browser reuse it briefly and revalidate in the background.
+router.get(
+  "/services",
+  (_req, res, next) => {
+    res.set("Cache-Control", "private, max-age=30, stale-while-revalidate=120")
+    next()
+  },
+  listBookableServicesController
+)
 router.get("/offers", async (req, res) => {
   try {
     const segment = req.appUser?.membershipSegment ?? (await getMembershipSegmentForUser(req.appUser?.id))

@@ -95,6 +95,9 @@ export const ensureBookingsSchema = createSchemaEnsurer({
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS image_url TEXT`)
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS variants_json JSONB NOT NULL DEFAULT '[]'::jsonb`)
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS created_by UUID REFERENCES users(id) ON DELETE SET NULL`)
+    // The customer catalog is `WHERE is_active ORDER BY name`; a partial index serves it without a sort.
+    await client.query(`CREATE INDEX IF NOT EXISTS service_catalog_active_name_idx ON service_catalog (name) WHERE is_active = TRUE`)
+    await client.query(`CREATE INDEX IF NOT EXISTS service_catalog_category_idx ON service_catalog (category)`)
     await client.query(`
       CREATE TABLE IF NOT EXISTS stylist_service_map (
         id UUID PRIMARY KEY,
@@ -104,6 +107,7 @@ export const ensureBookingsSchema = createSchemaEnsurer({
         UNIQUE(stylist_id, service_id)
       )
     `)
+    await client.query(`CREATE INDEX IF NOT EXISTS stylist_service_map_service_id_idx ON stylist_service_map (service_id)`)
     await client.query(`
       CREATE TABLE IF NOT EXISTS stylist_profiles (
         stylist_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
