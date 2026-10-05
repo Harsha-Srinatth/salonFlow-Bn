@@ -28,6 +28,7 @@ import {
   CUSTOMER_CANCELLATION_POLICY_RULES,
 } from "./cancellation-policy.js"
 import { canTransitionBookingStatus, normalizeBookingStatus, sanitizeBookingFilters } from "./validators.js"
+import { normalizeVariants, parseVariantSelections, priceCatalogForBooking } from "./variant-pricing.js"
 import { normalizeGallery, normalizeImageUrl, normalizeServiceDetails } from "./service-details.js"
 import {
   createServiceCatalogItem,
@@ -279,9 +280,8 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
   if (!resolvedServiceIds.length) throw Object.assign(new Error("At least one service is required"), { code: "BAD_REQUEST" })
   if (!stylistId) throw Object.assign(new Error("Stylist is required"), { code: "BAD_REQUEST" })
   if (!startsAt || Number.isNaN(new Date(startsAt).getTime())) throw Object.assign(new Error("Valid slot time is required"), { code: "BAD_REQUEST" })
-  const serviceCatalog = await listServiceCatalog()
-  const selectedServices = serviceCatalog.filter(item => resolvedServiceIds.includes(item.id))
-  if (selectedServices.length !== resolvedServiceIds.length) {
+  const baseCatalog = await listServiceCatalog()
+  if (baseCatalog.filter(item => resolvedServiceIds.includes(item.id)).length !== resolvedServiceIds.length) {
     throw Object.assign(new Error("One or more selected services are not available"), { code: "BAD_REQUEST" })
   }
   const customerAccount = await findOrCreateWalkinCustomerAccount({
@@ -294,6 +294,13 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
   // The tier decides the discount, so it is read from the customer's record. Taking it from
   // the request body let any receptionist pick PREMIUM pricing for any customer.
   const membershipSegment = await getMembershipSegmentForUser(customerAccount.id)
+  const serviceCatalog = priceCatalogForBooking({
+    catalog: baseCatalog,
+    serviceIds: resolvedServiceIds,
+    selections: parseVariantSelections(payload.variantSelections),
+    membershipSegment,
+  })
+  const selectedServices = serviceCatalog.filter(item => resolvedServiceIds.includes(item.id))
   const pricing = await computeBookingOfferPricing({
     serviceIds: resolvedServiceIds,
     membershipSegment,
@@ -488,15 +495,21 @@ export async function listRecommendedStylists({ serviceIds, startsAt, durationMi
   })
 }
 
-export async function listAvailableSlots({ serviceIds, date, customerGender }) {
+export async function listAvailableSlots({ serviceIds, date, customerGender, variantSelections }) {
   const safeServiceIds = Array.isArray(serviceIds) ? serviceIds.filter(Boolean) : []
   if (!safeServiceIds.length) throw Object.assign(new Error("serviceIds are required"), { code: "BAD_REQUEST" })
   if (!isTodayOrTomorrow(date)) throw Object.assign(new Error("Bookings are allowed only for today or tomorrow"), { code: "BAD_REQUEST" })
-  const services = await listServiceCatalog()
-  const selectedServices = services.filter(item => safeServiceIds.includes(item.id))
-  if (selectedServices.length !== safeServiceIds.length) {
+  const catalog = await listServiceCatalog()
+  if (catalog.filter(item => safeServiceIds.includes(item.id)).length !== safeServiceIds.length) {
     throw Object.assign(new Error("One or more services are invalid"), { code: "BAD_REQUEST" })
   }
+  // Only the duration matters here, so a variant that is not chosen yet falls back to the service duration.
+  const selectedServices = priceCatalogForBooking({
+    catalog,
+    serviceIds: safeServiceIds,
+    selections: parseVariantSelections(variantSelections),
+    strict: false,
+  }).filter(item => safeServiceIds.includes(item.id))
   const totalDuration = selectedServices.reduce((sum, item) => sum + Number(item.duration ?? item.durationMinutes ?? 0), 0)
   const eligibleStylists = await listEligibleStylistsForServices({ serviceIds: safeServiceIds, customerGender })
   const stylistIds = eligibleStylists.map(item => item.id)
@@ -564,9 +577,18 @@ export async function updateAdminServiceDiscounts({ items, actorUserId }) {
   return listAdminServices()
 }
 
+const DEFAULT_SERVICE_DURATION_MINUTES = 30
+
+function normalizeMemberPrice(value) {
+  if (value === null || value === undefined || `${value}`.trim() === "") return null
+  const price = Number(value)
+  if (!Number.isFinite(price) || price <= 0) throw Object.assign(new Error("Member price must be greater than 0, or left empty"), { code: "BAD_REQUEST" })
+  return price
+}
+
 function normalizeServiceGender(value) {
   const normalized = `${value ?? ""}`.trim().toUpperCase()
-  if (["MEN", "WOMEN", "UNISEX"].includes(normalized)) return normalized
+  if (["MEN", "WOMEN", "UNISEX", "BOY", "GIRL"].includes(normalized)) return normalized
   return null
 }
 
@@ -575,38 +597,26 @@ export async function createAdminService({ payload, actorUserId }) {
   const category = `${payload?.category ?? ""}`.trim().toUpperCase()
   const targetGender = normalizeServiceGender(payload?.gender)
   const basePrice = Number(payload?.basePrice ?? 0)
-  const duration = Number(payload?.duration ?? 0)
+  const duration = Number(payload?.duration) || DEFAULT_SERVICE_DURATION_MINUTES
   const description = `${payload?.description ?? ""}`.trim()
   const image = normalizeImageUrl(payload?.image, "Service image")
   const details = normalizeServiceDetails(payload?.details)
   const gallery = normalizeGallery(payload?.gallery)
-  const variantsRaw = Array.isArray(payload?.variants) ? payload.variants : []
-  const variants = variantsRaw.map(item => ({
-    name: `${item?.name ?? ""}`.trim(),
-    price: Number(item?.price ?? 0),
-    duration: Number(item?.duration ?? 0),
-  }))
+  const variants = normalizeVariants(payload?.variants, { defaultDuration: Number(payload?.duration) || DEFAULT_SERVICE_DURATION_MINUTES })
+  const memberPrice = normalizeMemberPrice(payload?.memberPrice)
   if (!name) throw Object.assign(new Error("Service name is required"), { code: "BAD_REQUEST" })
   if (!category) throw Object.assign(new Error("Service category is required"), { code: "BAD_REQUEST" })
-  if (!targetGender) throw Object.assign(new Error("Service gender must be men, women, or unisex"), { code: "BAD_REQUEST" })
+  if (!targetGender) throw Object.assign(new Error("Service audience must be men, women, unisex, boy, or girl"), { code: "BAD_REQUEST" })
   if (!Number.isFinite(basePrice) || basePrice <= 0) throw Object.assign(new Error("Base price must be greater than 0"), { code: "BAD_REQUEST" })
   if (!Number.isFinite(duration) || duration < 10 || duration > 480) {
     throw Object.assign(new Error("Duration must be between 10 and 480 minutes"), { code: "BAD_REQUEST" })
-  }
-  for (const variant of variants) {
-    if (!variant.name) throw Object.assign(new Error("Variant name is required"), { code: "BAD_REQUEST" })
-    if (!Number.isFinite(variant.price) || variant.price <= 0) {
-      throw Object.assign(new Error("Variant price must be greater than 0"), { code: "BAD_REQUEST" })
-    }
-    if (!Number.isFinite(variant.duration) || variant.duration < 10 || variant.duration > 480) {
-      throw Object.assign(new Error("Variant duration must be between 10 and 480 minutes"), { code: "BAD_REQUEST" })
-    }
   }
   const created = await createServiceCatalogItem({
     name,
     category,
     targetGender,
     basePrice,
+    memberPrice,
     durationMinutes: duration,
     description,
     imageUrl: image,
@@ -628,7 +638,7 @@ export async function updateAdminService({ serviceId, payload, actorUserId }) {
   const category = `${payload?.category ?? ""}`.trim().toUpperCase()
   const targetGender = normalizeServiceGender(payload?.gender)
   const basePrice = Number(payload?.basePrice ?? 0)
-  const duration = Number(payload?.duration ?? 0)
+  const duration = Number(payload?.duration) || DEFAULT_SERVICE_DURATION_MINUTES
   const description = `${payload?.description ?? ""}`.trim()
   const image = normalizeImageUrl(payload?.image, "Service image")
   const discountPercentRaw = payload?.discountPercent
@@ -637,12 +647,8 @@ export async function updateAdminService({ serviceId, payload, actorUserId }) {
   const isActive = payload?.isActive === undefined ? undefined : Boolean(payload.isActive)
   const details = payload?.details === undefined ? undefined : normalizeServiceDetails(payload.details)
   const gallery = payload?.gallery === undefined ? undefined : normalizeGallery(payload.gallery)
-  const variantsRaw = Array.isArray(payload?.variants) ? payload.variants : []
-  const variants = variantsRaw.map(item => ({
-    name: `${item?.name ?? ""}`.trim(),
-    price: Number(item?.price ?? 0),
-    duration: Number(item?.duration ?? 0),
-  }))
+  const variants = normalizeVariants(payload?.variants, { defaultDuration: Number(payload?.duration) || DEFAULT_SERVICE_DURATION_MINUTES })
+  const memberPrice = normalizeMemberPrice(payload?.memberPrice)
   if (!serviceId) throw Object.assign(new Error("Service id is required"), { code: "BAD_REQUEST" })
   if (!name || !category || !targetGender) throw Object.assign(new Error("Name, category and gender are required"), { code: "BAD_REQUEST" })
   if (!Number.isFinite(basePrice) || basePrice <= 0) throw Object.assign(new Error("Base price must be greater than 0"), { code: "BAD_REQUEST" })
@@ -652,17 +658,13 @@ export async function updateAdminService({ serviceId, payload, actorUserId }) {
       throw Object.assign(new Error("Discount percent must be between 0 and 100"), { code: "BAD_REQUEST" })
     }
   }
-  for (const variant of variants) {
-    if (!variant.name) throw Object.assign(new Error("Variant name is required"), { code: "BAD_REQUEST" })
-    if (!Number.isFinite(variant.price) || variant.price <= 0) throw Object.assign(new Error("Variant price must be greater than 0"), { code: "BAD_REQUEST" })
-    if (!Number.isFinite(variant.duration) || variant.duration < 10 || variant.duration > 480) throw Object.assign(new Error("Variant duration must be between 10 and 480 minutes"), { code: "BAD_REQUEST" })
-  }
   const updated = await updateServiceCatalogItem({
     id: serviceId,
     name,
     category,
     targetGender,
     basePrice,
+    memberPrice,
     durationMinutes: duration,
     description,
     imageUrl: image,
@@ -705,7 +707,9 @@ async function buildCustomerBookingContext({ payload, actorUser }) {
   const bookingDateIso = salonDateString(startsAt)
   if (!isTodayOrTomorrow(bookingDateIso)) throw Object.assign(new Error("Bookings are allowed only for today or tomorrow"), { code: "BAD_REQUEST" })
 
-  const serviceCatalog = await listServiceCatalog()
+  const baseCatalog = await listServiceCatalog()
+  const variantSelections = parseVariantSelections(payload.variantSelections)
+  const serviceCatalog = priceCatalogForBooking({ catalog: baseCatalog, serviceIds, selections: variantSelections, membershipSegment })
   const pricing = await computeBookingOfferPricing({
     serviceIds,
     membershipSegment,

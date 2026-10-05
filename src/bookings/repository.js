@@ -540,6 +540,7 @@ function toServiceDto(row) {
     category: row.category,
     gender: row.target_gender,
     basePrice: Number(row.base_price ?? 0),
+    memberPrice: row.member_price == null ? null : Number(row.member_price),
     duration: Number(row.duration_minutes ?? 45),
     description: row.description ?? "",
     image: row.image_url ?? "",
@@ -565,7 +566,7 @@ export async function listServiceCatalog({ includeInactive = false } = {}) {
 async function loadServiceCatalog({ includeInactive = false } = {}) {
   const { rows } = await pool.query(
     `
-      SELECT id, name, category, target_gender, base_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active, details_json, gallery_json
+      SELECT id, name, category, target_gender, base_price, member_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active, details_json, gallery_json
       FROM service_catalog
       WHERE ($1::boolean = TRUE OR is_active = TRUE)
       ORDER BY name ASC
@@ -580,6 +581,7 @@ export async function createServiceCatalogItem({
   category,
   targetGender,
   basePrice,
+  memberPrice,
   durationMinutes,
   description,
   imageUrl,
@@ -593,10 +595,10 @@ export async function createServiceCatalogItem({
     `
       INSERT INTO service_catalog (
         id, name, category, target_gender, base_price, duration_minutes,
-        description, image_url, variants_json, discount_percent, is_active, created_by, details_json, gallery_json
+        description, image_url, variants_json, discount_percent, is_active, created_by, details_json, gallery_json, member_price
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,0,TRUE,$10,$11::jsonb,$12::jsonb)
-      RETURNING id, name, category, target_gender, base_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active, details_json, gallery_json
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,0,TRUE,$10,$11::jsonb,$12::jsonb,$13)
+      RETURNING id, name, category, target_gender, base_price, member_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active, details_json, gallery_json
     `,
     [
       serviceId,
@@ -611,6 +613,7 @@ export async function createServiceCatalogItem({
       createdBy,
       JSON.stringify(details ?? {}),
       JSON.stringify(gallery ?? []),
+      memberPrice == null ? null : Number(memberPrice),
     ]
   )
   const service = rows[0]
@@ -625,6 +628,7 @@ export async function updateServiceCatalogItem({
   category,
   targetGender,
   basePrice,
+  memberPrice,
   durationMinutes,
   description,
   imageUrl,
@@ -650,9 +654,10 @@ export async function updateServiceCatalogItem({
         is_active = COALESCE($11::boolean, is_active),
         details_json = COALESCE($12::jsonb, details_json),
         gallery_json = COALESCE($13::jsonb, gallery_json),
+        member_price = $14,
         updated_at = NOW()
       WHERE id = $1
-      RETURNING id, name, category, target_gender, base_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active, details_json, gallery_json
+      RETURNING id, name, category, target_gender, base_price, member_price, duration_minutes, description, image_url, variants_json, discount_percent, is_active, details_json, gallery_json
     `,
     [
       id,
@@ -669,6 +674,7 @@ export async function updateServiceCatalogItem({
       // undefined = "not sent" (older admin clients): keep what is stored.
       details === undefined ? null : JSON.stringify(details),
       gallery === undefined ? null : JSON.stringify(gallery),
+      memberPrice == null ? null : Number(memberPrice),
     ]
   )
   if (rows[0]) await invalidateCatalogCaches()

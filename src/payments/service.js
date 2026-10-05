@@ -6,6 +6,7 @@ import { USER_PROFILE_COLUMNS, toAppUserDto } from "../lib/user-dto.js"
 import { ensureUserProfileSchema } from "../auth/schema-init.js"
 import { ensureBookingsSchema } from "../bookings/schema-init.js"
 import { createPaidCustomerBookingInTransaction, quoteCustomerBooking, runPostBookingEffects } from "../bookings/service.js"
+import { parseVariantSelections } from "../bookings/variant-pricing.js"
 import { ensureFeedbackSchema } from "../feedback/service.js"
 import { ensureLoyaltySchema } from "../loyalty/service.js"
 import { ensureMembershipSchema } from "../membership/service.js"
@@ -102,6 +103,7 @@ function snapshotPayload(payload, quote) {
   const serviceIds = [...new Set((Array.isArray(payload?.serviceIds) ? payload.serviceIds : []).map(id => `${id ?? ""}`.trim()).filter(Boolean))]
   return {
     serviceIds,
+    variantSelections: parseVariantSelections(payload?.variantSelections),
     stylistId: `${payload?.stylistId ?? ""}`.trim(),
     startsAt: quote.startsAt,
     comboId: `${payload?.comboId ?? ""}`.trim() || undefined,
@@ -114,6 +116,7 @@ function intentKeyFor(userId, snapshot, amountPaise) {
   const canonical = JSON.stringify([
     userId,
     [...snapshot.serviceIds].sort(),
+    Object.entries(snapshot.variantSelections ?? {}).sort(([a], [b]) => a.localeCompare(b)),
     snapshot.stylistId,
     snapshot.startsAt,
     snapshot.comboId ?? "",

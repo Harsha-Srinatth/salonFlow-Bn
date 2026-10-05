@@ -95,6 +95,11 @@ export const ensureBookingsSchema = createSchemaEnsurer({
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS image_url TEXT`)
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS variants_json JSONB NOT NULL DEFAULT '[]'::jsonb`)
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS created_by UUID REFERENCES users(id) ON DELETE SET NULL`)
+    // Member (Premium) price for single-price services; variants carry their own `memberPrice`.
+    // NULL = no member rate published ("NA" on the menu), never 0.
+    await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS member_price NUMERIC(12,2)`)
+    // Duration is not read from the printed menu; new services start at 30 min and are tuned in admin.
+    await client.query(`ALTER TABLE service_catalog ALTER COLUMN duration_minutes SET DEFAULT 30`)
     // Long-form "service details" sections and extra photos (see bookings/service-details.js).
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS details_json JSONB NOT NULL DEFAULT '{}'::jsonb`)
     await client.query(`ALTER TABLE service_catalog ADD COLUMN IF NOT EXISTS gallery_json JSONB NOT NULL DEFAULT '[]'::jsonb`)

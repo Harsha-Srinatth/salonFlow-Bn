@@ -104,3 +104,5 @@ desktop.ini
 # Misc
 # =========================
 *.tgz
+# DB dumps/JSON backups contain customer data
+backups/

@@ -624,8 +624,10 @@ export async function computeBookingOfferPricing({ serviceIds, membershipSegment
   const serviceItems = selectedServices.map(service => {
     const priced = preview.services.find(item => item.serviceId === service.id)
     const originalPrice = Number(service.basePrice ?? 0)
-    const finalPrice = Number(priced?.finalPrice ?? originalPrice)
     const appliedPercent = Number(priced?.appliedPercent ?? 0)
+    // Recomputed from the percent: `priced.finalPrice` was derived from the catalog list price, but
+    // the booking catalog may carry a chosen variant or member rate.
+    const finalPrice = Math.max(0, roundMoney(originalPrice - (originalPrice * appliedPercent) / 100))
     totalAmount += originalPrice
     payableAmount += finalPrice
     return {

@@ -269,6 +269,7 @@ export async function listAvailableSlotsController(req, res) {
       serviceIds,
       date,
       customerGender: resolveBookingCustomerGender(req),
+      variantSelections: req.query.variantSelections,
     })
     return sendPayload(req, res, 200, result)
   } catch (error) {
