@@ -40,6 +40,7 @@ import { broadcastQueueSnapshot, runQueueReminderSweep } from "./queue/service.j
 import { ensureLoyaltySchema, runReferralSettlementSweep } from "./loyalty/service.js"
 import { isRazorpayConfigured, razorpayConfig } from "./payments/config.js"
 import { ensurePaymentsRuntime, runRazorpaySweep } from "./payments/service.js"
+import { runMembershipSweep } from "./membership/purchases.js"
 
 assertProductionEnv()
 
@@ -326,6 +327,7 @@ if (isRazorpayConfigured()) {
     razorpaySweepRunning = true
     try {
       if (await tryAcquireSlot("sahasra:payments:razorpay-sweep", Math.max(1000, Math.round(razorpaySweepIntervalMs * 0.9)))) await runRazorpaySweep()
+      if (await tryAcquireSlot("sahasra:membership:sweep", Math.max(1000, Math.round(razorpaySweepIntervalMs * 0.9)))) await runMembershipSweep()
     } catch (error) {
       console.error("razorpay_sweep_failed", error)
     } finally {

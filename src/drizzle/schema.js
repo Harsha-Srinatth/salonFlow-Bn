@@ -68,7 +68,6 @@ export const users = pgTable("users", {
     walletBalance: bigint("wallet_balance", { mode: "number" }).notNull().default(0),
     isFirstBookingDone: boolean("is_first_booking_done").notNull().default(false),
     isUnderReview: boolean("is_under_review").notNull().default(false),
-    stripeCustomerId: varchar("stripe_customer_id", { length: 255 }).unique(),
     accountStatus: accountStatusEnum("account_status").notNull().default("ACTIVE"),
     passwordHash: varchar("password_hash", { length: 255 }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -235,13 +234,4 @@ export const walletTransactions = pgTable("wallet_transactions", {
     index("wallet_transactions_user_id_idx").on(table.userId),
     index("wallet_transactions_status_idx").on(table.status),
     index("wallet_transactions_created_at_idx").on(table.createdAt),
-]);
-export const stripeWebhookEvents = pgTable("stripe_webhook_events", {
-    id: uuid("id").defaultRandom().primaryKey(),
-    eventId: varchar("event_id", { length: 255 }).notNull().unique(),
-    eventType: varchar("event_type", { length: 255 }).notNull(),
-    processedAt: timestamp("processed_at", { withTimezone: true }).notNull().defaultNow(),
-}, table => [
-    index("stripe_webhook_events_event_id_idx").on(table.eventId),
-    index("stripe_webhook_events_processed_at_idx").on(table.processedAt),
 ]);

@@ -1,13 +1,7 @@
 import { v4 as uuid } from "uuid"
 import { pool } from "../lib/db-pool.js"
 import { createSchemaEnsurer } from "../lib/schema-guard.js"
-
-/**
- * Note: `stripe_webhook_events` (Drizzle schema) stores processed Stripe event IDs
- * so webhooks are not handled twice. It is NOT the membership plans table.
- * When Stripe checkout/subscriptions are wired, webhook handlers will update
- * `users.membership_segment` and log each event id in `stripe_webhook_events`.
- */
+import { isRazorpayConfigured, razorpayConfig } from "../payments/config.js"
 
 const PAID_SEGMENTS = ["BASIC", "PREMIUM"]
 
@@ -74,6 +68,14 @@ function parseBenefits(value) {
   return []
 }
 
+export const DURATION_OPTIONS = [1, 3, 6, 12]
+
+function intervalLabel(months) {
+  if (months === 1) return "month"
+  if (months === 12) return "year"
+  return `${months} months`
+}
+
 function toPlanDto(row) {
   const benefits = Array.isArray(row.benefits_json) ? row.benefits_json : []
   return {
@@ -83,8 +85,8 @@ function toPlanDto(row) {
     tagline: row.tagline ?? "",
     priceAmount: Number(row.price_amount ?? 0),
     currency: row.currency ?? "INR",
-    billingInterval: row.billing_interval ?? "month",
-    stripePriceId: row.stripe_price_id ?? "",
+    billingInterval: intervalLabel(Number(row.duration_months ?? 1)),
+    durationMonths: Number(row.duration_months ?? 1),
     benefits,
     isActive: Boolean(row.is_active),
     sortOrder: Number(row.sort_order ?? 0),
@@ -105,7 +107,6 @@ export const ensureMembershipSchema = createSchemaEnsurer({
         price_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
         currency VARCHAR(8) NOT NULL DEFAULT 'INR',
         billing_interval VARCHAR(16) NOT NULL DEFAULT 'month',
-        stripe_price_id VARCHAR(255),
         benefits_json JSONB NOT NULL DEFAULT '[]'::jsonb,
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
         sort_order INT NOT NULL DEFAULT 0,
@@ -113,6 +114,38 @@ export const ensureMembershipSchema = createSchemaEnsurer({
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `)
+    await client.query(`ALTER TABLE membership_plans ADD COLUMN IF NOT EXISTS duration_months INT NOT NULL DEFAULT 1`)
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS membership_expires_at TIMESTAMPTZ`)
+    // One row per Razorpay checkout for a plan: the membership payment lifecycle, kept apart from
+    // booking payments. Price and plan name are snapshotted so later plan edits never rewrite history.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS membership_purchases (
+        id UUID PRIMARY KEY,
+        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        segment VARCHAR(16) NOT NULL,
+        plan_name VARCHAR(255) NOT NULL,
+        duration_months INT NOT NULL,
+        amount NUMERIC(12,2) NOT NULL,
+        amount_paise BIGINT NOT NULL,
+        currency VARCHAR(3) NOT NULL DEFAULT 'INR',
+        status VARCHAR(16) NOT NULL DEFAULT 'CREATED',
+        razorpay_order_id VARCHAR(64),
+        razorpay_payment_id VARCHAR(64),
+        payment_method VARCHAR(32),
+        failure_reason TEXT,
+        payment_transaction_id UUID,
+        starts_at TIMESTAMPTZ,
+        expires_at TIMESTAMPTZ,
+        paid_at TIMESTAMPTZ,
+        checkout_expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `)
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS membership_purchases_order_uidx ON membership_purchases (razorpay_order_id) WHERE razorpay_order_id IS NOT NULL`)
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS membership_purchases_payment_uidx ON membership_purchases (razorpay_payment_id) WHERE razorpay_payment_id IS NOT NULL`)
+    await client.query(`CREATE INDEX IF NOT EXISTS membership_purchases_user_idx ON membership_purchases (user_id, created_at DESC)`)
+    await client.query(`CREATE INDEX IF NOT EXISTS membership_purchases_status_idx ON membership_purchases (status, created_at DESC)`)
     // Seeded on the same locked connection as the DDL that created the table:
     // the rows are not visible to other connections until this commits anyway,
     // and holding the lock means two instances cannot race the seed either.
@@ -152,13 +185,18 @@ export async function upsertMembershipPlan({ segment, payload }) {
   const tagline = `${payload?.tagline ?? ""}`.trim()
   const priceAmount = Number(payload?.priceAmount ?? 0)
   const currency = `${payload?.currency ?? "INR"}`.trim().toUpperCase() || "INR"
-  const billingInterval = `${payload?.billingInterval ?? "month"}`.trim().toLowerCase() || "month"
-  const stripePriceId = `${payload?.stripePriceId ?? ""}`.trim() || null
+  const durationMonths = Number(payload?.durationMonths ?? 1)
   const benefits = parseBenefits(payload?.benefits)
   const isActive = payload?.isActive !== false
   const sortOrder = Number(payload?.sortOrder ?? (normalizedSegment === "BASIC" ? 1 : 2))
 
   if (!name) throw Object.assign(new Error("Plan name is required"), { code: "BAD_REQUEST" })
+  if (!DURATION_OPTIONS.includes(durationMonths)) {
+    throw Object.assign(new Error("Duration must be 1, 3, 6 or 12 months"), { code: "BAD_REQUEST" })
+  }
+  if (isActive && priceAmount > 0 && priceAmount < 1) {
+    throw Object.assign(new Error("Online payments need a price of at least Rs 1"), { code: "BAD_REQUEST" })
+  }
   if (!Number.isFinite(priceAmount) || priceAmount < 0) {
     throw Object.assign(new Error("Price must be zero or greater"), { code: "BAD_REQUEST" })
   }
@@ -168,7 +206,7 @@ export async function upsertMembershipPlan({ segment, payload }) {
     `
       INSERT INTO membership_plans (
         id, segment, name, tagline, price_amount, currency, billing_interval,
-        stripe_price_id, benefits_json, is_active, sort_order
+        duration_months, benefits_json, is_active, sort_order
       )
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
       ON CONFLICT (segment) DO UPDATE SET
@@ -177,7 +215,7 @@ export async function upsertMembershipPlan({ segment, payload }) {
         price_amount = EXCLUDED.price_amount,
         currency = EXCLUDED.currency,
         billing_interval = EXCLUDED.billing_interval,
-        stripe_price_id = EXCLUDED.stripe_price_id,
+        duration_months = EXCLUDED.duration_months,
         benefits_json = EXCLUDED.benefits_json,
         is_active = EXCLUDED.is_active,
         sort_order = EXCLUDED.sort_order,
@@ -191,8 +229,8 @@ export async function upsertMembershipPlan({ segment, payload }) {
       tagline || null,
       priceAmount,
       currency,
-      billingInterval,
-      stripePriceId,
+      intervalLabel(durationMonths),
+      durationMonths,
       JSON.stringify(benefits.length ? benefits : DEFAULT_PAID_PLANS.find(p => p.segment === normalizedSegment)?.benefits ?? []),
       isActive,
       sortOrder,
@@ -208,6 +246,7 @@ export async function getAdminMembershipCenter() {
       SELECT membership_segment, COUNT(*)::INT AS total
       FROM users
       WHERE role = 'USER'
+        AND (membership_segment = 'FREE' OR membership_expires_at IS NULL OR membership_expires_at > NOW())
       GROUP BY membership_segment
     `
   )
@@ -216,15 +255,66 @@ export async function getAdminMembershipCenter() {
     const key = `${row.membership_segment ?? "FREE"}`.trim().toUpperCase()
     if (counts[key] !== undefined) counts[key] = row.total
   }
+  const { rows: statRows } = await pool.query(
+    `
+      SELECT
+        COALESCE(SUM(amount) FILTER (WHERE status = 'PAID'), 0)::float8 AS revenue_total,
+        COALESCE(SUM(amount) FILTER (WHERE status = 'PAID' AND paid_at >= NOW() - interval '30 days'), 0)::float8 AS revenue_30d,
+        COUNT(*) FILTER (WHERE status = 'PAID')::int AS paid_count,
+        COUNT(*) FILTER (WHERE status IN ('CREATED', 'FAILED', 'EXPIRED') AND created_at >= NOW() - interval '30 days')::int AS unfinished_30d,
+        COUNT(*) FILTER (WHERE status = 'MISMATCH')::int AS needs_review
+      FROM membership_purchases
+    `
+  )
+  const { rows: expiring } = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM users WHERE membership_segment <> 'FREE' AND membership_expires_at BETWEEN NOW() AND NOW() + interval '7 days'`
+  )
+  const stat = statRows[0] ?? {}
+  const config = razorpayConfig()
   return {
     freePlan: DEFAULT_FREE_PLAN,
     paidPlans: plans,
     customerCounts: counts,
+    razorpay: { configured: isRazorpayConfigured(), mode: config.mode, webhookConfigured: Boolean(config.webhookSecret) },
+    stats: {
+      revenueTotal: Number(stat.revenue_total ?? 0),
+      revenue30d: Number(stat.revenue_30d ?? 0),
+      paidCount: Number(stat.paid_count ?? 0),
+      unfinished30d: Number(stat.unfinished_30d ?? 0),
+      needsReview: Number(stat.needs_review ?? 0),
+      expiringSoon: Number(expiring[0]?.n ?? 0),
+    },
+    durationOptions: DURATION_OPTIONS,
   }
 }
 
-export async function getCustomerMembershipView({ membershipSegment }) {
-  const segment = `${membershipSegment ?? "FREE"}`.trim().toUpperCase() || "FREE"
+const SEGMENT_RANK = { FREE: 0, BASIC: 1, PREMIUM: 2 }
+
+/** What the customer can do with a plan: buy it, renew it, upgrade to it, or nothing (a lower tier). */
+function purchaseActionFor(plan, segment, active) {
+  const have = active ? SEGMENT_RANK[segment] ?? 0 : 0
+  const want = SEGMENT_RANK[plan.segment] ?? 0
+  if (want === 0) return null
+  if (have === want) return "RENEW"
+  if (have > want) return null
+  return have === 0 ? "BUY" : "UPGRADE"
+}
+
+export async function getCustomerMembershipView({ membershipSegment, userId } = {}) {
+  let segment = `${membershipSegment ?? "FREE"}`.trim().toUpperCase() || "FREE"
+  let expiresAt = null
+  if (userId) {
+    const { rows } = await pool.query(`SELECT membership_segment, membership_expires_at FROM users WHERE id = $1`, [userId])
+    if (rows[0]) {
+      segment = `${rows[0].membership_segment ?? "FREE"}`.trim().toUpperCase() || "FREE"
+      expiresAt = rows[0].membership_expires_at ?? null
+    }
+  }
+  // A lapsed paid plan counts as Free right away; the sweep tidies the row shortly after.
+  const lapsed = segment !== "FREE" && expiresAt && new Date(expiresAt).getTime() <= Date.now()
+  if (lapsed) segment = "FREE"
+  const active = segment !== "FREE"
+
   const paidPlans = await listMembershipPlans({ includeInactive: false })
   const currentPlan =
     segment === "FREE"
@@ -240,20 +330,20 @@ export async function getCustomerMembershipView({ membershipSegment }) {
           isActive: true,
         }
 
+  const withActions = paidPlans.map(plan => ({ ...plan, purchaseAction: purchaseActionFor(plan, segment, active) }))
   return {
     currentPlan: {
       segment: currentPlan.segment ?? segment,
       name: currentPlan.name,
       tagline: currentPlan.tagline ?? "",
-      isPaid: segment !== "FREE",
+      isPaid: active,
+      expiresAt: active ? expiresAt : null,
+      lapsed: Boolean(lapsed),
     },
     freePlan: DEFAULT_FREE_PLAN,
-    upgradePlans: paidPlans.filter(plan => {
-      if (segment === "FREE") return true
-      if (segment === "BASIC") return plan.segment === "PREMIUM"
-      return false
-    }),
-    allPlans: [DEFAULT_FREE_PLAN, ...paidPlans],
+    upgradePlans: withActions.filter(plan => plan.purchaseAction === "BUY" || plan.purchaseAction === "UPGRADE"),
+    allPlans: [DEFAULT_FREE_PLAN, ...withActions],
     showUpgradeBanner: segment === "FREE",
+    onlinePaymentsEnabled: isRazorpayConfigured(),
   }
 }

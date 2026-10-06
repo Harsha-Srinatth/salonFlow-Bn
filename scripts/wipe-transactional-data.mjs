@@ -29,7 +29,6 @@ const WIPE_ORDER = [
   "razorpay_payment_events",
   "razorpay_payments",
   "razorpay_webhook_events",
-  "stripe_webhook_events",
   "payment_transactions",
   "queue_reminders",
   "feedback",

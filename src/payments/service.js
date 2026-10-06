@@ -17,6 +17,7 @@ import { orderTtlMinutes, razorpayConfig } from "./config.js"
 import { RazorpayApiError, razorpay, verifyCheckoutSignature, verifyWebhookSignature } from "./razorpay-client.js"
 import { applyCancellationRefundWebhook, reconcileCancellationRefunds } from "./cancel-refund.js"
 import { ensurePaymentsSchema } from "./schema-init.js"
+import { applyMembershipRefund, handleMembershipGatewayPayment, isMembershipOrder } from "../membership/purchases.js"
 
 /**
  * Razorpay payment flow. The database is the source of truth: a booking exists only after a
@@ -845,11 +846,14 @@ export async function processRazorpayWebhook({ rawBody, signature, eventIdHeader
       if (!entity?.order_id) {
         result = "IGNORED_NO_ORDER"
       } else {
-        const outcome = await handleGatewayPayment({ gp: pickGatewayPayment(entity), source: "WEBHOOK" })
+        // Membership checkouts share the Razorpay account and webhook but are settled by their own module.
+        const outcome = (await isMembershipOrder(entity.order_id))
+          ? await handleMembershipGatewayPayment({ gp: pickGatewayPayment(entity), source: "WEBHOOK" })
+          : await handleGatewayPayment({ gp: pickGatewayPayment(entity), source: "WEBHOOK" })
         result = outcome?.result ?? "OK"
       }
     } else if (eventType === "refund.processed" || eventType === "refund.failed") {
-      result = await applyRefundWebhook({ refund: body?.payload?.refund?.entity, eventType })
+      result = (await applyMembershipRefund({ refund: body?.payload?.refund?.entity, eventType })) ?? (await applyRefundWebhook({ refund: body?.payload?.refund?.entity, eventType }))
     } else {
       result = "IGNORED_EVENT_TYPE"
     }

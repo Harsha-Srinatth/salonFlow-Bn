@@ -16,12 +16,14 @@ import {
   uploadAdminServiceImageController,
 } from "../bookings/controller.js"
 import { ensureBookingsSchema } from "../bookings/schema-init.js"
+import { getLiveRevenue } from "../revenue/live.js"
 import { pool } from "../lib/db-pool.js"
 import { GENDER_UNSPECIFIED, normalizeCustomerGender, parseSelectableGender } from "../lib/gender.js"
 import { isValidFullName } from "../lib/validation.js"
 import { requireAppRole, requireFirebaseAuth } from "../middleware/auth.js"
 import { ensureOfferSchema, createComboOffer, createMembershipDiscount, createServiceDiscount, deleteOfferByType, getOfferCenterData, listOfferCalendarEvents, previewOffers, updateOfferByType, upsertGlobalDiscount } from "../offers/service.js"
 import { ensureMembershipSchema, getAdminMembershipCenter, upsertMembershipPlan } from "../membership/service.js"
+import { listMembershipPurchases, reconcileMembershipPurchase } from "../membership/purchases.js"
 import { ensureFeedbackSchema, getFeedbackSummary, listAdminFeedback, updateFeedbackStatus } from "../feedback/service.js"
 import {
   approveReferral,
@@ -287,6 +289,13 @@ router.get("/payroll/policy", getPayrollPolicyController)
 router.patch("/payroll/policy", updatePayrollPolicyController)
 router.get("/payroll/deductions", listMonthlyDeductionsController)
 router.get("/reports/payments", getAdminRevenueReportController)
+router.get("/reports/revenue-live", async (req, res, next) => {
+  try {
+    res.json(await getLiveRevenue({ days: req.query.days }))
+  } catch (error) {
+    next(error)
+  }
+})
 
 router.get("/users/gender-pending", async (_req, res) => {
   const { rows } = await pool.query(
@@ -773,6 +782,26 @@ router.get("/membership", async (_req, res) => {
   } catch (error) {
     console.error("Failed to load membership center", error)
     return res.status(500).json({ error: "Could not load membership plans" })
+  }
+})
+
+router.get("/membership/purchases", async (req, res) => {
+  try {
+    return res.json(await listMembershipPurchases({ status: req.query.status, search: req.query.search, limit: req.query.limit, offset: req.query.offset }))
+  } catch (error) {
+    console.error("Failed to list membership purchases", error)
+    return res.status(500).json({ error: "Could not load membership payments" })
+  }
+})
+
+router.post("/membership/purchases/:id/reconcile", async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(400).json({ error: "Invalid request" })
+  try {
+    return res.json(await reconcileMembershipPurchase(req.params.id))
+  } catch (error) {
+    if (error?.code === "NOT_FOUND") return res.status(404).json({ error: error.message })
+    console.error("Failed to reconcile membership purchase", error?.code ?? error?.message)
+    return res.status(502).json({ error: "Could not check with Razorpay right now" })
   }
 })
 

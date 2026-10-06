@@ -10,6 +10,7 @@ import {
 } from "../lib/catalog-cache.js"
 import { SALON_TIMEZONE, SALON_TODAY_START_SQL, SALON_TOMORROW_START_SQL, salonDayStartSql } from "../lib/salon-time.js"
 import { roundMoney } from "../lib/money.js"
+import { recordRevenueEvent } from "../revenue/telemetry.js"
 import { GENDER_UNSPECIFIED, normalizeCustomerGender } from "../lib/gender.js"
 import { decryptPiiText, encryptPiiText } from "../security/crypto-envelope.js"
 import { normalizeBookingStatus } from "./validators.js"
@@ -41,6 +42,14 @@ function buildPaymentHistoryMeta(sourceType, amount) {
       direction: "OUT",
       isRefund: true,
       signedAmount: -absAmount,
+    }
+  }
+  if (normalized === "MEMBERSHIP") {
+    return {
+      transactionLabel: "Membership purchase",
+      direction: "IN",
+      isRefund: false,
+      signedAmount: absAmount,
     }
   }
   if (normalized === "WALKIN") {
@@ -1144,6 +1153,7 @@ export async function createPaymentTransaction({
     ]
   )
   void invalidateRevenueSummary(SALON_TIMEZONE).catch(() => undefined)
+  if (rows[0]) recordRevenueEvent(rows[0].id)
   return rows[0] ?? null
 }
 
@@ -1181,7 +1191,8 @@ function toPaymentHistoryDto(row) {
 export async function listPaymentTransactions({ month, paymentMode, from, to, limit = 100, offset = 0 }) {
   const where = []
   const values = []
-  if (month && /^\d{4}-\d{2}$/.test(`${month}`.trim())) {
+  // A custom from/to range replaces the month filter; ANDing them hid every payment outside the month.
+  if (!from && !to && month && /^\d{4}-\d{2}$/.test(`${month}`.trim())) {
     const start = new Date(`${month}-01T00:00:00.000Z`)
     const end = new Date(start)
     end.setUTCMonth(end.getUTCMonth() + 1)

@@ -4,6 +4,8 @@ import { parseSelectableGender } from "../lib/gender.js"
 import { isValidFullName, normalizeName, parseDateOfBirth } from "../lib/validation.js"
 import { USER_PROFILE_COLUMNS, toAppUserDto } from "../lib/user-dto.js"
 import { ensureMembershipSchema, getCustomerMembershipView } from "../membership/service.js"
+import { getMembershipPurchaseStatus, startMembershipCheckout, verifyMembershipPayment } from "../membership/purchases.js"
+import { paymentCreateRateLimit, paymentStatusRateLimit } from "../middleware/rate-limiters.js"
 import {
   ensureOfferSchema,
   getCustomerOffersForUser,
@@ -90,11 +92,56 @@ router.get("/offers", async (req, res) => {
 router.get("/membership", async (req, res) => {
   try {
     const segment = req.appUser?.membershipSegment ?? (await getMembershipSegmentForUser(req.appUser?.id))
-    const membership = await getCustomerMembershipView({ membershipSegment: segment })
+    const membership = await getCustomerMembershipView({ membershipSegment: segment, userId: req.appUser?.id })
     return res.json(membership)
   } catch (error) {
     console.error("Failed to load customer membership", error)
     return res.status(500).json({ error: "Could not load membership" })
+  }
+})
+const ORDER_ID = /^order_[A-Za-z0-9]{6,40}$/
+const PAYMENT_ID = /^pay_[A-Za-z0-9]{6,40}$/
+const SIGNATURE = /^[a-f0-9]{64}$/
+function membershipPaymentError(res, error, label) {
+  switch (error?.code) {
+    case "BAD_REQUEST":
+      return res.status(400).json({ error: error.message })
+    case "NOT_FOUND":
+      return res.status(404).json({ error: "Payment not found" })
+    case "INVALID_SIGNATURE":
+    case "ORDER_MISMATCH":
+      return res.status(400).json({ error: "We could not verify this payment.", code: "VERIFICATION_FAILED" })
+    case "GATEWAY_UNAVAILABLE":
+      return res.status(502).json({ error: error.message, code: "GATEWAY_UNAVAILABLE" })
+    default:
+      console.error(label, error)
+      return res.status(500).json({ error: "Internal server error" })
+  }
+}
+router.post("/membership/checkout", paymentCreateRateLimit, async (req, res) => {
+  try {
+    return res.json(await startMembershipCheckout({ actorUser: req.appUser, segment: req.body?.segment }))
+  } catch (error) {
+    return membershipPaymentError(res, error, "Failed to start membership checkout")
+  }
+})
+router.post("/membership/verify", paymentStatusRateLimit, async (req, res) => {
+  const orderId = `${req.body?.razorpay_order_id ?? ""}`
+  const paymentId = `${req.body?.razorpay_payment_id ?? ""}`
+  const signature = `${req.body?.razorpay_signature ?? ""}`
+  if (!ORDER_ID.test(orderId) || !PAYMENT_ID.test(paymentId) || !SIGNATURE.test(signature)) return res.status(400).json({ error: "Invalid request" })
+  try {
+    return res.json(await verifyMembershipPayment({ userId: req.appUser.id, orderId, paymentId, signature }))
+  } catch (error) {
+    return membershipPaymentError(res, error, "Failed to verify membership payment")
+  }
+})
+router.get("/membership/orders/:orderId/status", paymentStatusRateLimit, async (req, res) => {
+  if (!ORDER_ID.test(req.params.orderId)) return res.status(400).json({ error: "Invalid request" })
+  try {
+    return res.json(await getMembershipPurchaseStatus({ userId: req.appUser.id, orderId: req.params.orderId }))
+  } catch (error) {
+    return membershipPaymentError(res, error, "Failed to read membership payment status")
   }
 })
 router.get("/stylists/recommendations", listRecommendedStylistsController)

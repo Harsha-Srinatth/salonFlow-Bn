@@ -50,7 +50,6 @@ export async function ensureBaseSchema(client) {
       wallet_balance BIGINT NOT NULL DEFAULT 0,
       is_first_booking_done BOOLEAN NOT NULL DEFAULT FALSE,
       is_under_review BOOLEAN NOT NULL DEFAULT FALSE,
-      stripe_customer_id VARCHAR(255),
       account_status account_status NOT NULL DEFAULT 'ACTIVE',
       password_hash VARCHAR(255),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -59,8 +58,7 @@ export async function ensureBaseSchema(client) {
       CONSTRAINT users_phone_unique UNIQUE (phone),
       CONSTRAINT users_firebase_uid_unique UNIQUE (firebase_uid),
       CONSTRAINT users_device_id_unique UNIQUE (device_id),
-      CONSTRAINT users_referral_code_unique UNIQUE (referral_code),
-      CONSTRAINT users_stripe_customer_id_unique UNIQUE (stripe_customer_id)
+      CONSTRAINT users_referral_code_unique UNIQUE (referral_code)
     )
   `)
   await client.query(`CREATE INDEX IF NOT EXISTS users_email_idx ON users(email)`)
