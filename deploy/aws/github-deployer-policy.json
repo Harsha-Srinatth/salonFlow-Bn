@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:CompleteLayerUpload",
+        "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart"
+      ],
+      "Resource": "arn:aws:ecr:ap-southeast-2:961913912951:repository/sahasra-backend"
+    },
+    { "Effect": "Allow", "Action": ["ec2:DescribeInstances", "ssm:GetCommandInvocation"], "Resource": "*" },
+    {
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ec2:ap-southeast-2:961913912951:instance/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/Name": "sahasra-api" } }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ssm:ap-southeast-2::document/AWS-RunShellScript"
+    }
+  ]
+}
