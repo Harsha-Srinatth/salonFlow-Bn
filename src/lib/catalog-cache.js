@@ -9,6 +9,8 @@ export const CATALOG_ACTIVE_CACHE_KEY = "sahasra:svc:catalog:active:v1"
 export const CATALOG_ALL_CACHE_KEY = "sahasra:svc:catalog:all:v1"
 export const OFFER_ROWS_CACHE_KEY = "sahasra:offers:rows:v1"
 export const REVENUE_SUMMARY_CACHE_PREFIX = "sahasra:revenue:summary:v1:"
+/** Active, bookable stylists (customer booking, reception, walk-in). Dropped on any staff write. */
+export const STYLIST_ROSTER_CACHE_KEY = "sahasra:stylists:roster:v1"
 
 /** Service catalog changed: the catalog lists and the offer center (which embeds services) are stale. */
 export async function invalidateCatalogCaches() {
@@ -25,4 +27,8 @@ export async function invalidateOfferCaches() {
 
 export function invalidateRevenueSummary(timezone) {
   return invalidateCacheKey(`${REVENUE_SUMMARY_CACHE_PREFIX}${timezone}`)
+}
+
+export function invalidateStylistRoster() {
+  return invalidateCacheKey(STYLIST_ROSTER_CACHE_KEY)
 }

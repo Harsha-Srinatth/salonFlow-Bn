@@ -181,3 +181,19 @@ export const assistantIpRateLimit = createLimiter({
   windowMs: 60 * 1000,
   limit: Number(process.env.RATE_ASSISTANT_IP_MAX ?? 60),
 })
+
+/**
+ * WhatsApp OTP request (`POST /api/auth/whatsapp-otp/request` and the staff variant). Every
+ * request can cost a paid WhatsApp message, so this per-IP limiter is the first line; the
+ * OTP service adds per-phone and per-IP hourly caps counted in the database.
+ */
+export const whatsappOtpRequestRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_WHATSAPP_OTP_REQUEST_WINDOW_MS ?? 15 * 60 * 1000),
+  limit: Number(process.env.RATE_WHATSAPP_OTP_REQUEST_MAX ?? 10),
+})
+
+/** WhatsApp OTP verify. Wrong codes also lock the challenge after WHATSAPP_OTP_MAX_ATTEMPTS. */
+export const whatsappOtpVerifyRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_WHATSAPP_OTP_VERIFY_WINDOW_MS ?? 15 * 60 * 1000),
+  limit: Number(process.env.RATE_WHATSAPP_OTP_VERIFY_MAX ?? 30),
+})

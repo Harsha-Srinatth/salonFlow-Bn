@@ -18,6 +18,7 @@ import {
 import { ensureBookingsSchema } from "../bookings/schema-init.js"
 import { getLiveRevenue } from "../revenue/live.js"
 import { pool } from "../lib/db-pool.js"
+import { invalidateStylistRoster } from "../lib/catalog-cache.js"
 import { GENDER_UNSPECIFIED, normalizeCustomerGender, parseSelectableGender } from "../lib/gender.js"
 import { isValidFullName } from "../lib/validation.js"
 import { requireAppRole, requireFirebaseAuth } from "../middleware/auth.js"
@@ -40,6 +41,7 @@ import { ensureQueueSchema } from "../queue/schema-init.js"
 import { queueLiveRateLimit } from "../middleware/rate-limiters.js"
 import { publishOfferEvent, publishServiceCatalogEvent } from "../realtime/socket-gateway.js"
 import adminBookingRoutes from "./admin-bookings.js"
+import whatsappAdminRoutes from "./whatsapp-admin.js"
 import { ensureBusinessSchema, getAdminBusinessProfile, updateBusinessProfile } from "../business/service.js"
 import { ensureAgentSchema, getAgentUsageSummary } from "../agents/agent-log.js"
 import { isLlmConfigured, AGENT_MODEL } from "../agents/llm.js"
@@ -133,6 +135,17 @@ router.use(async (_req, _res, next) => {
   }
 })
 router.use("/bookings", adminBookingRoutes)
+router.use("/whatsapp", whatsappAdminRoutes)
+// Any successful staff write (create, edit, shifts, leaves, delete) can change who is bookable,
+// so drop the cached stylist roster once the response has gone out.
+router.use("/staff", (req, res, next) => {
+  if (req.method !== "GET") {
+    res.on("finish", () => {
+      if (res.statusCode < 400) void invalidateStylistRoster()
+    })
+  }
+  next()
+})
 router.get("/loyalty", async (_req, res) => {
   try {
     const overview = await getAdminLoyaltyOverview()

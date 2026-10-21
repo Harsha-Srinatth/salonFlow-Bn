@@ -4,6 +4,7 @@ import { cachedRead } from "../lib/cache.js"
 import {
   CATALOG_ACTIVE_CACHE_KEY,
   CATALOG_ALL_CACHE_KEY,
+  STYLIST_ROSTER_CACHE_KEY,
   REVENUE_SUMMARY_CACHE_PREFIX,
   invalidateCatalogCaches,
   invalidateRevenueSummary,
@@ -529,7 +530,12 @@ export async function lookupWalkinCustomerByPhoneOrEmail({ customerEmail, custom
   }
 }
 
-export async function listReceptionStylists() {
+export function listReceptionStylists() {
+  // Read on every booking/walk-in screen, changed only by admin staff edits (which invalidate it).
+  return cachedRead(STYLIST_ROSTER_CACHE_KEY, { l1TtlMs: 10_000, l2TtlMs: 60_000, load: loadReceptionStylists })
+}
+
+async function loadReceptionStylists() {
   const { rows } = await pool.query(
     `
       SELECT u.id, u.name, u.email, u.phone

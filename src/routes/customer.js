@@ -33,6 +33,7 @@ import { ensureQueueSchema } from "../queue/schema-init.js"
 import { requireAppRole, requireFirebaseAuth } from "../middleware/auth.js"
 import { queueLiveRateLimit } from "../middleware/rate-limiters.js"
 import { publishBookingEvent, publishPaymentEvent } from "../realtime/socket-gateway.js"
+import { getMarketingPreference, setMarketingPreference } from "../whatsapp/campaigns.js"
 
 const router = express.Router()
 
@@ -187,6 +188,35 @@ router.post("/bookings/:id/feedback", async (req, res) => {
  * rather than being cleared. Email and phone are excluded — both are verified
  * identity, tied to the Firebase account, and are not editable here.
  */
+/**
+ * WhatsApp offers consent. Separate from booking messages, which are transactional and are
+ * sent regardless. Opting in is only ever an explicit action by the customer.
+ */
+router.get("/whatsapp-preferences", async (req, res, next) => {
+  try {
+    return res.json(await getMarketingPreference({ phone: req.appUser.phone }))
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.put("/whatsapp-preferences", async (req, res, next) => {
+  try {
+    if (typeof req.body?.marketingOptIn !== "boolean") {
+      return res.status(400).json({ error: "marketingOptIn must be true or false" })
+    }
+    const preference = await setMarketingPreference({
+      phone: req.appUser.phone,
+      userId: req.appUser.id,
+      optIn: req.body.marketingOptIn,
+      source: "CUSTOMER_PROFILE",
+    })
+    return res.json(preference)
+  } catch (error) {
+    next(error)
+  }
+})
+
 router.patch("/profile", async (req, res) => {
   try {
     const updates = []

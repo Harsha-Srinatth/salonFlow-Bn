@@ -43,8 +43,24 @@ import {
   passwordResetRequestRateLimit,
   staffFirebaseVerifyRateLimit,
   staffSetPasswordRateLimit,
+  whatsappOtpRequestRateLimit,
+  whatsappOtpVerifyRateLimit,
 } from "../middleware/rate-limiters.js"
+import {
+  consumeOtpChallenge,
+  issuePhoneProof,
+  loadUsablePhoneProof,
+  normalizeOtpPhone,
+  OtpError,
+  requestWhatsAppOtp,
+  verifyWhatsAppOtp,
+} from "../whatsapp/otp.js"
+import { ensureWhatsAppSchema } from "../whatsapp/schema-init.js"
+import { maskPhone, phoneLookupCandidates } from "../whatsapp/phone.js"
+import { queueWelcomeMessage } from "../whatsapp/notifications.js"
+import { whatsappConfig } from "../whatsapp/config.js"
 import bcrypt from "bcryptjs"
+import { invalidateStylistRoster } from "../lib/catalog-cache.js"
 import { isSessionTokenLive } from "../middleware/auth.js"
 import { signStaffAccessToken, signStaffSetupToken, verifyStaffAccessToken, verifyStaffSetupToken } from "../lib/tokens.js"
 import { verifyFirebaseToken } from "../lib/firebase-admin.js"
@@ -125,12 +141,16 @@ async function phoneExistsInDb(phone) {
  * taken from the claim, and a header that disagrees with it means the browser verified one
  * number and asked to register another.
  *
+ * The phone factor is now normally a WhatsApp OTP: the browser carries a signed, single-use
+ * proof from `/api/auth/whatsapp-otp/verify` and `verifiedPhone` is the number in it. A
+ * Firebase `phone_number` claim is still accepted so an older client keeps working.
+ *
  * @param {{ email_verified?: boolean, phone_number?: string }} firebase Decoded claims
  * @param {string} requestedPhone E.164 the client asked to register
+ * @param {string} verifiedPhone E.164 proven by the WhatsApp OTP proof or the Firebase claim
  * @returns {{ status: number, error: string, reason: string } | null} null when both factors hold
  */
-function describeRegistrationVerificationFailure(firebase, requestedPhone) {
-  const verifiedPhone = typeof firebase.phone_number === "string" ? firebase.phone_number.trim() : ""
+function describeRegistrationVerificationFailure(firebase, requestedPhone, verifiedPhone) {
   if (!verifiedPhone) {
     return { status: 403, error: "PHONE_NOT_VERIFIED", reason: "phone_not_verified" }
   }
@@ -240,7 +260,14 @@ async function handlePostSession(req, res) {
   // signal available without fingerprinting the user.
   const requestedDeviceId = typeof req.headers["x-device-id"] === "string" ? req.headers["x-device-id"].trim() : ""
   const firebase = req.firebaseUser
-  const verifiedPhone = typeof firebase.phone_number === "string" ? firebase.phone_number.trim() : ""
+  const claimPhone = typeof firebase.phone_number === "string" ? firebase.phone_number.trim() : ""
+  // WhatsApp OTP proof (signed by this server, checked against an unconsumed VERIFIED challenge).
+  let phoneProof = null
+  if (!claimPhone && req.body?.phoneProof) {
+    await ensureWhatsAppSchema()
+    phoneProof = await loadUsablePhoneProof(req.body.phoneProof)
+  }
+  const verifiedPhone = claimPhone || phoneProof?.phone || ""
   // Identify the account only from facts the signed token proves: its uid, a mailbox
   // Firebase marked verified, and the phone number it actually delivered an SMS to.
   // The `x-user-phone` header and an unverified e-mail are whatever the caller typed;
@@ -271,7 +298,7 @@ async function handlePostSession(req, res) {
       return res.status(404).json({ error: "ACCOUNT_NOT_FOUND" })
     }
     // Both factors, checked against signed token claims, before anything is written.
-    const verificationFailure = describeRegistrationVerificationFailure(firebase, requestedPhone)
+    const verificationFailure = describeRegistrationVerificationFailure(firebase, requestedPhone, verifiedPhone)
     if (verificationFailure) {
       auditAuthAsync("auth", "session_register_denied", {
         ip,
@@ -310,19 +337,41 @@ async function handlePostSession(req, res) {
     // password_hash, which cannot tell a Google customer apart from one whose
     // password was never set — see lib/auth-provider.js.
     const authProvider = resolveSignupAuthProvider(firebase, { hasPassword: Boolean(signupPasswordHash) })
-    const { rows } = await pool.query(
-      `
+    const insertSql = `
         INSERT INTO users (
           name, email, phone, gender, firebase_uid, role, latitude, longitude, account_status,
           email_verified, phone_verified, password_hash, auth_provider
         )
         VALUES ($1, $2, $3, $4, $5, $6, 0, 0, 'ACTIVE', TRUE, TRUE, $7, $8)
         RETURNING ${USER_PROFILE_COLUMNS}
-      `,
-      // `verifiedPhone` over the client header: the header is whatever the browser
-      // typed, the claim is the number Firebase actually delivered an SMS to.
-      [requestedName, resolvedEmail, verifiedPhone, requestedGender, firebase.uid, requestedRole, signupPasswordHash, authProvider]
-    )
+      `
+    // `verifiedPhone` over the client header: the header is whatever the browser
+    // typed, the proof/claim is the number a code was actually delivered to.
+    const insertValues = [requestedName, resolvedEmail, verifiedPhone, requestedGender, firebase.uid, requestedRole, signupPasswordHash, authProvider]
+    let rows
+    if (phoneProof) {
+      // The WhatsApp proof is spent in the same transaction as the INSERT: one verified
+      // code creates at most one account, even if the request is replayed concurrently.
+      const client = await pool.connect()
+      try {
+        await client.query("BEGIN")
+        const consumed = await consumeOtpChallenge(client, phoneProof.challengeId, { phone: phoneProof.phone, purpose: "SIGNUP" })
+        if (!consumed) {
+          await client.query("ROLLBACK")
+          auditAuthAsync("auth", "session_register_denied", { ip, reason: "phone_proof_used", firebaseUid: firebase.uid })
+          return res.status(403).json({ error: "PHONE_NOT_VERIFIED" })
+        }
+        ;({ rows } = await client.query(insertSql, insertValues))
+        await client.query("COMMIT")
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {})
+        throw error
+      } finally {
+        client.release()
+      }
+    } else {
+      ;({ rows } = await pool.query(insertSql, insertValues))
+    }
     auditAuthAsync("auth", "session_register_success", {
       ip,
       userId: rows[0].id,
@@ -337,6 +386,9 @@ async function handlePostSession(req, res) {
       ip,
       deviceId: requestedDeviceId,
     }).catch(error => console.error("apply_referral_on_signup_route_failed", error))
+    // Only on this first-registration path: returning customers never reach here, and the
+    // outbox key is the user id, so a retried registration cannot queue a second welcome.
+    queueWelcomeMessage(pool, rows[0]).catch(error => console.error("queue_welcome_failed", { error: error?.message }))
     return res.json({ user: toAppUserDto(rows[0]) })
   }
 
@@ -357,7 +409,12 @@ async function handlePostSession(req, res) {
   // verified" would strip a flag they already earned. The flags only ever move
   // false → true, on fresh proof.
   const provesEmail = firebase.email_verified === true && !dbUser.email_verified
-  const provesPhone = Boolean(verifiedPhone) && !dbUser.phone_verified
+  // A WhatsApp proof only counts for the number it proves, and is spent here too.
+  const proofMatchesAccount = Boolean(phoneProof) && phoneLookupCandidates(phoneProof.phone).includes(dbUser.phone)
+  if (proofMatchesAccount) {
+    await consumeOtpChallenge(pool, phoneProof.challengeId, { phone: phoneProof.phone, purpose: "SIGNUP" })
+  }
+  const provesPhone = (Boolean(claimPhone) || proofMatchesAccount) && !dbUser.phone_verified
   // Fill in the provider for accounts that predate the column, using the token that
   // just proved who they are. Guarded on there being no password_hash: an account
   // that can already be signed into with an app password must not be relabelled
@@ -865,10 +922,171 @@ async function handleStaffSetPassword(req, res) {
       return res.status(404).json({ error: "User not found" })
     }
     auditAuthAsync("auth", "staff_set_password_success", { ip, userId: payload.sub })
+    // The stylist just became ACTIVE, so they now belong in the cached booking roster.
+    void invalidateStylistRoster()
     return res.json({ success: true })
   } catch (error) {
     auditAuthAsync("auth", "staff_set_password_failure", { ip, message: error instanceof Error ? error.message : "error" })
     return res.status(400).json({ error: error instanceof Error ? error.message : "Could not set password" })
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// WhatsApp OTP (replaces Firebase SMS for phone verification)
+
+const CUSTOMER_PHONE_LOGIN_ROLES = ["USER", "ADMIN"]
+const STAFF_ROLES = ["STAFF", "RECEPTIONIST"]
+
+function sendOtpError(res, error) {
+  if (!(error instanceof OtpError)) throw error
+  if (error.retryAfterSeconds) res.set("Retry-After", `${error.retryAfterSeconds}`)
+  return res.status(error.status).json({
+    error: error.code,
+    message: error.message,
+    ...(error.retryAfterSeconds ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
+    ...(error.attemptsRemaining !== undefined ? { attemptsRemaining: error.attemptsRemaining } : {}),
+  })
+}
+
+/** Accounts holding this number (E.164 or a legacy stored form), newest first. */
+async function findAccountsByPhone(phone) {
+  const { rows } = await pool.query(
+    `SELECT ${USER_PROFILE_COLUMNS}, app_session_epoch FROM users WHERE phone = ANY($1::text[])
+     ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 5`,
+    [phoneLookupCandidates(phone)]
+  )
+  return rows
+}
+
+function parseCustomerOtpPurpose(value) {
+  const purpose = `${value ?? ""}`.trim().toUpperCase()
+  if (purpose !== "LOGIN" && purpose !== "SIGNUP") {
+    throw new OtpError(400, "INVALID_PURPOSE", "purpose must be LOGIN or SIGNUP")
+  }
+  return purpose
+}
+
+/**
+ * POST /api/auth/whatsapp-otp/request  { phone, purpose: "LOGIN" | "SIGNUP" }
+ * LOGIN only sends to a number with a customer account; SIGNUP only to an unregistered one
+ * (each message costs money, and the answer is already public via /phone-exists).
+ */
+async function handleWhatsAppOtpRequest(req, res) {
+  const ip = getClientIp(req)
+  try {
+    const purpose = parseCustomerOtpPurpose(req.body?.purpose)
+    const phone = normalizeOtpPhone(req.body?.phone)
+    if (purpose === "LOGIN" && !whatsappConfig().otpLoginEnabled) {
+      return res.status(403).json({ error: "PHONE_LOGIN_DISABLED", message: "Phone sign-in is not available. Please sign in with email or Google." })
+    }
+    await ensureWhatsAppSchema()
+    const accounts = await findAccountsByPhone(phone)
+    if (purpose === "LOGIN" && !accounts.some(user => CUSTOMER_PHONE_LOGIN_ROLES.includes(user.role))) {
+      auditAuthAsync("auth", "whatsapp_otp_request_denied", { ip, purpose, reason: "no_account", phone: maskPhone(phone) })
+      return res.status(404).json({ error: "ACCOUNT_NOT_FOUND", message: "No account found for this phone number. Please sign up first." })
+    }
+    if (purpose === "SIGNUP" && accounts.length) {
+      auditAuthAsync("auth", "whatsapp_otp_request_denied", { ip, purpose, reason: "phone_registered", phone: maskPhone(phone) })
+      return res.status(409).json({ error: "PHONE_ALREADY_REGISTERED", message: "This phone number is already registered. Sign in instead." })
+    }
+    const result = await requestWhatsAppOtp({ phone, purpose, ip })
+    auditAuthAsync("auth", "whatsapp_otp_requested", { ip, purpose, phone: maskPhone(phone), deduplicated: result.deduplicated })
+    return res.json({
+      ok: true,
+      phone,
+      channel: "WHATSAPP",
+      expiresInSeconds: result.expiresInSeconds,
+      resendAvailableInSeconds: result.resendAvailableInSeconds,
+      deduplicated: result.deduplicated,
+    })
+  } catch (error) {
+    if (error instanceof OtpError) auditAuthAsync("auth", "whatsapp_otp_request_failed", { ip, code: error.code })
+    return sendOtpError(res, error)
+  }
+}
+
+/**
+ * POST /api/auth/whatsapp-otp/verify  { phone, purpose, code }
+ *  - LOGIN: signs the customer in (HTTP-only app cookie, same as password login).
+ *  - SIGNUP: returns a short-lived single-use `phoneProof` for `/api/auth/session`.
+ */
+async function handleWhatsAppOtpVerify(req, res) {
+  const ip = getClientIp(req)
+  try {
+    const purpose = parseCustomerOtpPurpose(req.body?.purpose)
+    const phone = normalizeOtpPhone(req.body?.phone)
+    await ensureWhatsAppSchema()
+    const verified = await verifyWhatsAppOtp({ phone, purpose, code: req.body?.code })
+    if (purpose === "SIGNUP") {
+      const phoneProof = await issuePhoneProof(verified)
+      auditAuthAsync("auth", "whatsapp_otp_verified", { ip, purpose, phone: maskPhone(phone) })
+      return res.json({ ok: true, phone, phoneProof })
+    }
+    const user = (await findAccountsByPhone(phone)).find(row => CUSTOMER_PHONE_LOGIN_ROLES.includes(row.role))
+    if (!user) {
+      await consumeOtpChallenge(pool, verified.challengeId)
+      return res.status(404).json({ error: "ACCOUNT_NOT_FOUND", message: "No account found for this phone number. Please sign up first." })
+    }
+    if (!(await consumeOtpChallenge(pool, verified.challengeId, { phone, purpose: "LOGIN" }))) {
+      return res.status(400).json({ error: "OTP_NOT_FOUND", message: "That code was already used. Request a new code." })
+    }
+    if (!user.phone_verified) {
+      await pool.query("UPDATE users SET phone_verified = TRUE, updated_at = NOW() WHERE id = $1", [user.id])
+      user.phone_verified = true
+    }
+    const accessToken = await signStaffAccessToken(user.id, undefined, { sessionEpoch: Number(user.app_session_epoch ?? 0) })
+    res.cookie("staff_access_token", "", { maxAge: 0, httpOnly: true, secure: isProduction, sameSite: isProduction ? "none" : "lax", path: "/" })
+    res.cookie("app_access_token", accessToken, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
+      path: "/",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    })
+    auditAuthAsync("auth", "whatsapp_otp_login_success", { ip, userId: user.id, role: user.role })
+    return res.json({ ok: true, user: toAppUserDto(user) })
+  } catch (error) {
+    if (error instanceof OtpError) auditAuthAsync("auth", "whatsapp_otp_verify_failed", { ip, code: error.code })
+    return sendOtpError(res, error)
+  }
+}
+
+/** POST /api/auth/staff/whatsapp-otp/request { phone } — only for numbers on a staff account. */
+async function handleStaffWhatsAppOtpRequest(req, res) {
+  const ip = getClientIp(req)
+  try {
+    const phone = normalizeOtpPhone(req.body?.phone)
+    await ensureWhatsAppSchema()
+    const staff = (await findAccountsByPhone(phone)).find(row => STAFF_ROLES.includes(row.role))
+    if (!staff) {
+      auditAuthAsync("auth", "staff_whatsapp_otp_denied", { ip, reason: "no_staff_for_phone" })
+      return res.status(404).json({ error: "No staff account found for this phone" })
+    }
+    const result = await requestWhatsAppOtp({ phone, purpose: "STAFF_SETUP", ip })
+    auditAuthAsync("auth", "staff_whatsapp_otp_requested", { ip, userId: staff.id, deduplicated: result.deduplicated })
+    return res.json({ ok: true, phone, channel: "WHATSAPP", expiresInSeconds: result.expiresInSeconds, resendAvailableInSeconds: result.resendAvailableInSeconds })
+  } catch (error) {
+    return sendOtpError(res, error)
+  }
+}
+
+/** POST /api/auth/staff/whatsapp-otp/verify { phone, code } — exchanges the code for the password-setup token. */
+async function handleStaffWhatsAppOtpVerify(req, res) {
+  const ip = getClientIp(req)
+  try {
+    const phone = normalizeOtpPhone(req.body?.phone)
+    await ensureWhatsAppSchema()
+    const verified = await verifyWhatsAppOtp({ phone, purpose: "STAFF_SETUP", code: req.body?.code })
+    const staff = (await findAccountsByPhone(phone)).find(row => STAFF_ROLES.includes(row.role))
+    const consumed = await consumeOtpChallenge(pool, verified.challengeId, { phone, purpose: "STAFF_SETUP" })
+    if (!staff) return res.status(404).json({ error: "No staff account found for this phone" })
+    if (!consumed) return res.status(400).json({ error: "OTP_NOT_FOUND", message: "That code was already used. Request a new code." })
+    const setupToken = await signStaffSetupToken({ sub: staff.id, phone: staff.phone })
+    auditAuthAsync("auth", "staff_whatsapp_verify_success", { ip, userId: staff.id })
+    return res.json({ setupToken })
+  } catch (error) {
+    if (error instanceof OtpError) auditAuthAsync("auth", "staff_whatsapp_verify_failure", { ip, code: error.code })
+    return sendOtpError(res, error)
   }
 }
 
@@ -900,6 +1118,10 @@ router.post("/staff/login", staffLoginRateLimit, handleStaffLogin)
 router.post("/staff/logout", handleStaffLogout)
 router.get("/staff/me", handleStaffMe)
 router.post("/staff/verify-firebase-phone", staffFirebaseVerifyRateLimit, handleStaffVerifyFirebasePhone)
+router.post("/whatsapp-otp/request", whatsappOtpRequestRateLimit, handleWhatsAppOtpRequest)
+router.post("/whatsapp-otp/verify", whatsappOtpVerifyRateLimit, handleWhatsAppOtpVerify)
+router.post("/staff/whatsapp-otp/request", whatsappOtpRequestRateLimit, handleStaffWhatsAppOtpRequest)
+router.post("/staff/whatsapp-otp/verify", whatsappOtpVerifyRateLimit, handleStaffWhatsAppOtpVerify)
 router.post("/request-password-reset", passwordResetRequestRateLimit, handleRequestPasswordReset)
 router.post("/complete-db-password-reset", passwordResetCompleteRateLimit, handleCompleteDbPasswordReset)
 router.post("/staff/set-password", staffSetPasswordRateLimit, handleStaffSetPassword)

@@ -212,6 +212,45 @@ export const ensureBookingsSchema = createSchemaEnsurer({
       CREATE INDEX IF NOT EXISTS audit_logs_resource_idx ON audit_logs(resource_type, resource_id)
     `)
 
+    // Hot-path composites (added after all the columns above exist):
+    //  - slot availability (NOT EXISTS overlap per stylist) and the stylist day/range lists
+    //    filter by stylist + start time over active bookings only; the single-column
+    //    stylist_id index made Postgres read every historic booking of that stylist.
+    //  - payroll and the queue estimator's duration stats scan COMPLETED bookings by completed_at.
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS bookings_stylist_active_starts_idx
+      ON bookings (stylist_id, starts_at)
+      WHERE status IN ('PENDING', 'CONFIRMED', 'STARTED')
+    `)
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS bookings_completed_at_idx
+      ON bookings (completed_at)
+      WHERE status = 'COMPLETED'
+    `)
+    // Customer history: e-mail OR phone, newest first, excluding rows the customer removed.
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS bookings_customer_visible_starts_idx
+      ON bookings (lower(customer_email), starts_at DESC)
+      WHERE hidden_from_customer_at IS NULL
+    `)
+    // Admin search is `ILIKE '%term%'` on customer/service name, which a btree can't serve.
+    // Trigram GIN indexes can. pg_trgm ships with Postgres and Neon; if the role may not create
+    // extensions the block is skipped instead of failing the boot (the search still works, unindexed).
+    await client.query(`
+      DO $$
+      BEGIN
+        BEGIN
+          CREATE EXTENSION IF NOT EXISTS pg_trgm;
+        EXCEPTION WHEN OTHERS THEN
+          NULL;
+        END;
+        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') THEN
+          CREATE INDEX IF NOT EXISTS bookings_customer_name_trgm_idx ON bookings USING gin (customer_name gin_trgm_ops);
+          CREATE INDEX IF NOT EXISTS bookings_service_name_trgm_idx ON bookings USING gin (service_name gin_trgm_ops);
+        END IF;
+      END $$;
+    `)
+
     // Seeding runs on the same locked client, inside the same transaction. On a
     // separate connection it would deadlock: these writes take a row-share lock
     // on `users` for the foreign keys, while another instance's bootstrap holds

@@ -1,4 +1,5 @@
 import { v4 as uuid } from "uuid"
+import { cachedRead, invalidateCacheKey } from "../lib/cache.js"
 import { pool } from "../lib/db-pool.js"
 import { createSchemaEnsurer } from "../lib/schema-guard.js"
 import { isRazorpayConfigured, razorpayConfig } from "../payments/config.js"
@@ -162,7 +163,18 @@ export const ensureMembershipSchema = createSchemaEnsurer({
   },
 })
 
-export async function listMembershipPlans({ includeInactive = false } = {}) {
+const PLANS_CACHE_KEY = (includeInactive) => `sahasra:membership:plans:${includeInactive ? "all" : "active"}:v1`
+
+/** Plans are read by every membership/offers screen and changed only by an admin (which invalidates). */
+export function listMembershipPlans({ includeInactive = false } = {}) {
+  return cachedRead(PLANS_CACHE_KEY(includeInactive), {
+    l1TtlMs: 30_000,
+    l2TtlMs: 300_000,
+    load: () => loadMembershipPlans({ includeInactive }),
+  })
+}
+
+async function loadMembershipPlans({ includeInactive }) {
   await ensureMembershipSchema()
   const where = includeInactive ? "" : "WHERE is_active = TRUE"
   const { rows } = await pool.query(
@@ -236,6 +248,7 @@ export async function upsertMembershipPlan({ segment, payload }) {
       sortOrder,
     ]
   )
+  await Promise.all([invalidateCacheKey(PLANS_CACHE_KEY(true)), invalidateCacheKey(PLANS_CACHE_KEY(false))])
   return toPlanDto(rows[0])
 }
 

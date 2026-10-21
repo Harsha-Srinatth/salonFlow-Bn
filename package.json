@@ -5,13 +5,16 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "dev:nodemon": "nodemon src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "node --test --test-concurrency=1 --import ./test/whatsapp/setup.js test/whatsapp/*.test.js",
+    "whatsapp:check": "node scripts/whatsapp-check.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",
     "@socket.io/redis-adapter": "^8.3.0",
     "bcryptjs": "^2.4.3",
     "cloudinary": "^2.10.0",
+    "compression": "^1.8.1",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
