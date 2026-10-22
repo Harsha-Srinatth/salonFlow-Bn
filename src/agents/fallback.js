@@ -54,7 +54,7 @@ export async function answerWithoutModel(question) {
   if (faq) return faq.answer
 
   if (/\b(hours?|timings?|time|open|opens|close|closes|closing|opening|lunch)\b/.test(text) && !/\b(slot|available|availability|book)\b/.test(text)) {
-    return `We're open ${hours.days.toLowerCase()} from ${hours.opens} to ${hours.closes}, with a lunch break from ${hours.lunchBreak.from} to ${hours.lunchBreak.to}. ${hours.bookingWindow}`
+    return `We're open ${hours.days.toLowerCase()} from ${hours.opens} to ${hours.closes}${hours.lunchBreak ? `, with a lunch break from ${hours.lunchBreak.from} to ${hours.lunchBreak.to}` : ""}. ${hours.bookingWindow}`
   }
   if (/\b(cancel|cancell?ation|refunds?|reschedul)/.test(text)) {
     return `Cancellation and refunds:\n${cancellationPolicy.map(rule => `• ${rule.when}: ${rule.refund}`).join("\n")}\nYou can cancel from Bookings > History; the exact refund is shown before you confirm.`

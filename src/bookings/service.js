@@ -76,13 +76,8 @@ import {
   lockStylistSchedule,
 } from "./repository.js"
 
-import {
-  LUNCH_END_MINUTES,
-  LUNCH_START_MINUTES,
-  SALON_CLOSE_MINUTES,
-  SALON_OPEN_MINUTES,
-  SLOT_STEP_MINUTES,
-} from "./constants.js"
+import { SLOT_STEP_MINUTES } from "./constants.js"
+import { getSalonHours, minutesToLabel } from "../business/service.js"
 const NOTIFY_TIMEZONE = process.env.SALON_TIMEZONE ?? "Asia/Kolkata"
 
 function formatNotifyDateTime(iso) {
@@ -120,6 +115,28 @@ function overlaps(aStart, aEnd, bStart, bEnd) {
 
 function roundUpToSlotMinute(totalMinutes, stepMinutes) {
   return Math.ceil(totalMinutes / stepMinutes) * stepMinutes
+}
+
+function durationLabel(minutes) {
+  const h = Math.floor(minutes / 60)
+  const m = minutes % 60
+  if (!h) return `${m} min`
+  return m ? `${h} h ${m} min` : `${h} h`
+}
+
+function overlapsLunch(hours, start, end) {
+  return hours.lunchStart !== null && overlaps(start, end, hours.lunchStart, hours.lunchEnd)
+}
+
+/**
+ * Latest minute a booking of `duration` can start and still finish by closing, on the slot grid,
+ * stepping back over lunch when the last stretch is too short. Null when it fits nowhere in the day.
+ */
+function latestStartMinute(hours, duration) {
+  for (let minute = Math.floor((hours.close - duration) / SLOT_STEP_MINUTES) * SLOT_STEP_MINUTES; minute >= hours.open; minute -= SLOT_STEP_MINUTES) {
+    if (!overlapsLunch(hours, minute, minute + duration)) return minute
+  }
+  return null
 }
 
 export async function listAdminBookings(query) {
@@ -245,19 +262,32 @@ function isValidPhone(phone) {
 async function assertBookableWindow({ client, stylistId, startsAt, durationMinutes, graceMinutes }) {
   const fail = message => Object.assign(new Error(message), { code: "BAD_REQUEST" })
   if (startsAt.getTime() < Date.now() - graceMinutes * 60_000) throw fail("That time has already passed")
+  const hours = await getSalonHours()
   const startMinute = salonMinutesOfDay(startsAt)
   const endMinute = startMinute + durationMinutes
-  if (startMinute < SALON_OPEN_MINUTES || endMinute > SALON_CLOSE_MINUTES) {
-    throw fail("The salon is closed at that time (open 08:00 to 23:00)")
+  const lastStart = latestStartMinute(hours, durationMinutes)
+  if (lastStart === null) {
+    throw fail(`These services take ${durationLabel(durationMinutes)}, too long to fit into one salon day. Book some of them as a separate visit.`)
   }
-  if (overlaps(startMinute, endMinute, LUNCH_START_MINUTES, LUNCH_END_MINUTES)) throw fail("That time falls in the lunch break")
+  if (startMinute < hours.open) throw fail(`The salon opens at ${minutesToLabel(hours.open)}`)
+  if (endMinute > hours.close) {
+    throw fail(
+      `This booking takes ${durationLabel(durationMinutes)} and would end at ${minutesToLabel(endMinute % 1440)}, after the salon closes at ${minutesToLabel(hours.close)}. The latest start time for it is ${minutesToLabel(lastStart)}.`
+    )
+  }
+  if (overlapsLunch(hours, startMinute, endMinute)) {
+    throw fail(`That time runs into the lunch break (${minutesToLabel(hours.lunchStart)} to ${minutesToLabel(hours.lunchEnd)})`)
+  }
   const { rows: shiftRows } = await client.query(
     "SELECT shift_start, shift_end FROM stylist_shift_windows WHERE stylist_id = $1 LIMIT 1",
     [stylistId]
   )
-  const shiftStart = hhmmToMinutes(shiftRows[0]?.shift_start, SALON_OPEN_MINUTES)
-  const shiftEnd = hhmmToMinutes(shiftRows[0]?.shift_end, SALON_CLOSE_MINUTES)
-  if (startMinute < shiftStart || endMinute > shiftEnd) throw fail("That stylist is not working at that time")
+  const shiftStart = hhmmToMinutes(shiftRows[0]?.shift_start, hours.open)
+  const shiftEnd = hhmmToMinutes(shiftRows[0]?.shift_end, hours.close)
+  if (startMinute < shiftStart) throw fail(`That stylist starts at ${minutesToLabel(shiftStart)}`)
+  if (endMinute > shiftEnd) {
+    throw fail(`That stylist's shift ends at ${minutesToLabel(shiftEnd)}, and this ${durationLabel(durationMinutes)} booking would end at ${minutesToLabel(endMinute % 1440)}`)
+  }
   const { rows: leaveRows } = await client.query(
     "SELECT 1 FROM stylist_leaves WHERE stylist_id = $1 AND $2::date BETWEEN leave_start AND leave_end LIMIT 1",
     [stylistId, salonDateString(startsAt)]
@@ -536,22 +566,26 @@ export async function listAvailableSlots({ serviceIds, date, customerGender, var
     list.push({ start, end })
     byStylist.set(booking.stylist_id, list)
   }
+  const hours = await getSalonHours()
   const slots = []
   const now = new Date()
   const isToday = date === salonDateString(now)
   const nowMinutesRaw = salonMinutesOfDay(now) + (now.getSeconds() > 0 || now.getMilliseconds() > 0 ? 1 : 0)
   const earliestMinute = isToday
-    ? Math.max(SALON_OPEN_MINUTES, roundUpToSlotMinute(nowMinutesRaw, SLOT_STEP_MINUTES))
-    : SALON_OPEN_MINUTES
+    ? Math.max(hours.open, roundUpToSlotMinute(nowMinutesRaw, SLOT_STEP_MINUTES))
+    : hours.open
+  // A slot is offered only when the whole booking (every selected service back to back) ends by
+  // closing time, so the last start moves earlier as services are added.
+  const lastStart = latestStartMinute(hours, totalDuration)
 
-  for (let minute = earliestMinute; minute + totalDuration <= SALON_CLOSE_MINUTES; minute += SLOT_STEP_MINUTES) {
+  for (let minute = earliestMinute; lastStart !== null && minute <= lastStart; minute += SLOT_STEP_MINUTES) {
+    if (overlapsLunch(hours, minute, minute + totalDuration)) continue
     const slotStart = buildDateAtMinutes(date, minute)
     const slotEnd = new Date(slotStart.getTime() + totalDuration * 60 * 1000)
-    if (overlaps(minute, minute + totalDuration, LUNCH_START_MINUTES, LUNCH_END_MINUTES)) continue
     const availableStylists = eligibleStylists.filter(stylist => {
       if (onLeaveSet.has(stylist.id)) return false
-      const shiftStart = hhmmToMinutes(stylist.shift_start, SALON_OPEN_MINUTES)
-      const shiftEnd = hhmmToMinutes(stylist.shift_end, SALON_CLOSE_MINUTES)
+      const shiftStart = hhmmToMinutes(stylist.shift_start, hours.open)
+      const shiftEnd = hhmmToMinutes(stylist.shift_end, hours.close)
       if (minute < shiftStart || minute + totalDuration > shiftEnd) return false
       const windows = byStylist.get(stylist.id) ?? []
       return !windows.some(window => overlaps(slotStart.getTime(), slotEnd.getTime(), window.start, window.end))
@@ -564,7 +598,42 @@ export async function listAvailableSlots({ serviceIds, date, customerGender, var
       })
     }
   }
-  return { totalDuration, slots }
+
+  // When nothing is offered, say why, so the customer knows whether to change the day, the
+  // services, or neither.
+  let emptyReason = null
+  let message = null
+  if (!slots.length) {
+    if (lastStart === null) {
+      emptyReason = "TOO_LONG"
+      message = `Your services take ${durationLabel(totalDuration)}, too long to fit into one salon day. Remove a service, or book some of them as a separate visit.`
+    } else if (!eligibleStylists.length) {
+      emptyReason = "NO_STYLIST"
+      message = "No stylist offers all of these services together. Try booking them separately."
+    } else if (earliestMinute > lastStart) {
+      emptyReason = "PAST_LAST_START"
+      message = `Your services take ${durationLabel(totalDuration)} and the salon closes at ${minutesToLabel(hours.close)}, so the last start time ${isToday ? "today" : "that day"} is ${minutesToLabel(lastStart)}. Try tomorrow, or fewer services.`
+    } else {
+      emptyReason = "FULLY_BOOKED"
+      message = "Every stylist is booked for the rest of this day. Try the other day."
+    }
+  }
+
+  return {
+    totalDuration,
+    slots,
+    hours: {
+      opensAt: buildDateAtMinutes(date, hours.open).toISOString(),
+      closesAt: buildDateAtMinutes(date, hours.close).toISOString(),
+      lunch:
+        hours.lunchStart === null
+          ? null
+          : { startsAt: buildDateAtMinutes(date, hours.lunchStart).toISOString(), endsAt: buildDateAtMinutes(date, hours.lunchEnd).toISOString() },
+    },
+    lastStartAt: lastStart === null ? null : buildDateAtMinutes(date, lastStart).toISOString(),
+    emptyReason,
+    message,
+  }
 }
 
 export async function updateAdminServiceDiscounts({ items, actorUserId }) {

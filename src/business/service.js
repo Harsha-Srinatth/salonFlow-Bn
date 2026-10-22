@@ -87,11 +87,55 @@ function cleanUrl(value, field) {
   return url.toString()
 }
 
+const HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)$/
+
+function hhmmToMinutes(value) {
+  const match = HHMM_RE.exec(`${value ?? ""}`.trim())
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null
+}
+
+function minutesToHhmm(minutes) {
+  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`
+}
+
+const DEFAULT_HOURS = {
+  opensAt: minutesToHhmm(SALON_OPEN_MINUTES),
+  closesAt: minutesToHhmm(SALON_CLOSE_MINUTES),
+  lunchFrom: minutesToHhmm(LUNCH_START_MINUTES),
+  lunchTo: minutesToHhmm(LUNCH_END_MINUTES),
+}
+
+/**
+ * Opening hours the admin sets in Settings; the slot generator and the booking checks read them
+ * through getSalonHours(). Both lunch fields empty means no lunch break. `strict` throws on bad
+ * input (admin save); otherwise an unusable stored value quietly falls back to the defaults.
+ */
+export function normalizeSalonHours(input, { strict = true } = {}) {
+  const source = input && typeof input === "object" ? input : {}
+  const pick = field => (field in source ? `${source[field] ?? ""}`.trim() : DEFAULT_HOURS[field])
+  const hours = { opensAt: pick("opensAt"), closesAt: pick("closesAt"), lunchFrom: pick("lunchFrom"), lunchTo: pick("lunchTo") }
+  const open = hhmmToMinutes(hours.opensAt)
+  const close = hhmmToMinutes(hours.closesAt)
+  const lunchFrom = hhmmToMinutes(hours.lunchFrom)
+  const lunchTo = hhmmToMinutes(hours.lunchTo)
+  const noLunch = hours.lunchFrom === "" && hours.lunchTo === ""
+  let problem = null
+  if (open === null || close === null) problem = "Opening and closing times must be HH:MM"
+  else if (close - open < 60) problem = "The salon must be open for at least an hour"
+  else if (!noLunch && (lunchFrom === null || lunchTo === null)) problem = "Set both lunch times, or clear both for no lunch break"
+  else if (!noLunch && (lunchTo <= lunchFrom || lunchFrom < open || lunchTo > close)) problem = "Lunch break must fall inside opening hours"
+  if (problem) {
+    if (strict) throw fail(problem)
+    return { ...DEFAULT_HOURS }
+  }
+  return noLunch ? { ...hours, lunchFrom: "", lunchTo: "" } : hours
+}
+
 /**
  * Validate and normalise an admin-submitted profile. Unknown keys are dropped, so the stored
  * JSON can only ever contain the fields above.
  */
-export function normalizeBusinessProfile(input) {
+export function normalizeBusinessProfile(input, { strict = true } = {}) {
   const source = input && typeof input === "object" ? input : {}
   const profile = {}
   for (const [field, max] of Object.entries(TEXT_FIELDS)) {
@@ -112,6 +156,7 @@ export function normalizeBusinessProfile(input) {
   for (const item of profile.faq) {
     if (!item.question || !item.answer) throw fail("Each FAQ entry needs both a question and an answer")
   }
+  profile.hours = normalizeSalonHours(source.hours, { strict })
   return profile
 }
 
@@ -122,7 +167,7 @@ async function loadProfileRow() {
   // Re-normalise on read: tolerates older/partial rows and guarantees every key exists.
   let profile
   try {
-    profile = normalizeBusinessProfile(stored)
+    profile = normalizeBusinessProfile(stored, { strict: false })
   } catch {
     profile = normalizeBusinessProfile({})
   }
@@ -149,7 +194,7 @@ export async function updateBusinessProfile({ payload, actorUserId }) {
   return getAdminBusinessProfile()
 }
 
-function minutesToLabel(minutes) {
+export function minutesToLabel(minutes) {
   const h = Math.floor(minutes / 60)
   const m = minutes % 60
   const suffix = h >= 12 ? "PM" : "AM"
@@ -157,13 +202,30 @@ function minutesToLabel(minutes) {
   return `${hour12}:${String(m).padStart(2, "0")} ${suffix}`
 }
 
+/**
+ * The salon's working day in minutes after midnight, as the booking engine enforces it.
+ * `lunchStart`/`lunchEnd` are null when there is no lunch break.
+ */
+export async function getSalonHours() {
+  const { profile } = await getBusinessProfile()
+  const hours = normalizeSalonHours(profile.hours, { strict: false })
+  const noLunch = hours.lunchFrom === ""
+  return {
+    open: hhmmToMinutes(hours.opensAt),
+    close: hhmmToMinutes(hours.closesAt),
+    lunchStart: noLunch ? null : hhmmToMinutes(hours.lunchFrom),
+    lunchEnd: noLunch ? null : hhmmToMinutes(hours.lunchTo),
+  }
+}
+
 /** Opening hours as enforced by the booking engine (not free text, so it cannot drift). */
-export function getOperatingHours() {
+export function getOperatingHours(salonHours) {
+  const { open, close, lunchStart, lunchEnd } = salonHours
   return {
     timezone: SALON_TIMEZONE,
-    opens: minutesToLabel(SALON_OPEN_MINUTES),
-    closes: minutesToLabel(SALON_CLOSE_MINUTES),
-    lunchBreak: { from: minutesToLabel(LUNCH_START_MINUTES), to: minutesToLabel(LUNCH_END_MINUTES) },
+    opens: minutesToLabel(open),
+    closes: minutesToLabel(close),
+    lunchBreak: lunchStart === null ? null : { from: minutesToLabel(lunchStart), to: minutesToLabel(lunchEnd) },
     days: "Every day",
     bookingWindow: `Online bookings can be made for today or tomorrow (${BOOKING_WINDOW_DAYS} days).`,
   }
@@ -186,7 +248,7 @@ export async function getPublicBusinessInfo() {
   const { profile } = await getBusinessProfile()
   return {
     profile,
-    hours: getOperatingHours(),
+    hours: getOperatingHours(await getSalonHours()),
     cancellationPolicy: getCancellationPolicy(),
     missingFields: missingEssentials(profile),
   }
@@ -194,5 +256,5 @@ export async function getPublicBusinessInfo() {
 
 export async function getAdminBusinessProfile() {
   const { profile, updatedAt } = await getBusinessProfile()
-  return { profile, updatedAt, missingFields: missingEssentials(profile), hours: getOperatingHours() }
+  return { profile, updatedAt, missingFields: missingEssentials(profile), hours: getOperatingHours(await getSalonHours()) }
 }
