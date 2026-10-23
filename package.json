@@ -6,7 +6,7 @@
     "dev": "node --watch src/server.js",
     "dev:nodemon": "nodemon src/server.js",
     "start": "node src/server.js",
-    "test": "node --test --test-concurrency=1 --import ./test/whatsapp/setup.js test/whatsapp/*.test.js",
+    "test": "node --test --test-concurrency=1 --import ./test/whatsapp/setup.js test/whatsapp/*.test.js test/regression/*.test.js",
     "whatsapp:check": "node scripts/whatsapp-check.mjs"
   },
   "dependencies": {

@@ -106,3 +106,6 @@ desktop.ini
 *.tgz
 # DB dumps/JSON backups contain customer data
 backups/
+
+# Local QA account credentials (scripts/qa-accounts.mjs)
+.qa-accounts.local.json

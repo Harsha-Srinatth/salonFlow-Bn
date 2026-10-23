@@ -1,10 +1,12 @@
 import express from "express"
+import { rejectMalformedId } from "../lib/validation.js"
 import { getReceptionCancellationPreviewController, listBookingsController, updateBookingStatusController } from "../bookings/controller.js"
 import { ensureBookingsSchema } from "../bookings/schema-init.js"
 import { adminBookingsListRateLimit, adminBookingsUpdateRateLimit } from "../middleware/rate-limiters.js"
 import { publishBookingEvent, publishPaymentEvent } from "../realtime/socket-gateway.js"
 
 const router = express.Router()
+router.param("id", rejectMalformedId)
 
 router.use(async (_req, _res, next) => {
   try {

@@ -1,4 +1,5 @@
 import express from "express"
+import { rejectMalformedId } from "../lib/validation.js"
 import { requireAnyAppRole, requireFirebaseAuth } from "../middleware/auth.js"
 import {
   ensureNotificationsSchema,
@@ -9,6 +10,7 @@ import {
 } from "../notifications/service.js"
 
 const router = express.Router()
+router.param("id", rejectMalformedId)
 
 router.use(requireFirebaseAuth, requireAnyAppRole(["ADMIN", "RECEPTIONIST", "STAFF", "USER"]))
 router.use(async (_req, _res, next) => {

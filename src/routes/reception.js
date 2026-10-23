@@ -1,4 +1,5 @@
 import express from "express"
+import { rejectMalformedId } from "../lib/validation.js"
 import {
   createReceptionPaymentController,
   createReceptionBookingController,
@@ -24,6 +25,7 @@ import { publishBookingEvent } from "../realtime/socket-gateway.js"
 import { publishPaymentEvent } from "../realtime/socket-gateway.js"
 
 const router = express.Router()
+router.param("id", rejectMalformedId)
 
 router.use(requireStaffSessionAuth, requireAppRole("RECEPTIONIST"))
 router.use(async (_req, _res, next) => {

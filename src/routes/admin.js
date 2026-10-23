@@ -20,7 +20,7 @@ import { getLiveRevenue } from "../revenue/live.js"
 import { pool } from "../lib/db-pool.js"
 import { invalidateStylistRoster } from "../lib/catalog-cache.js"
 import { GENDER_UNSPECIFIED, normalizeCustomerGender, parseSelectableGender } from "../lib/gender.js"
-import { isValidFullName } from "../lib/validation.js"
+import { isValidFullName, rejectMalformedId } from "../lib/validation.js"
 import { requireAppRole, requireFirebaseAuth } from "../middleware/auth.js"
 import { ensureOfferSchema, createComboOffer, createMembershipDiscount, createServiceDiscount, deleteOfferByType, getOfferCenterData, listOfferCalendarEvents, previewOffers, updateOfferByType, upsertGlobalDiscount } from "../offers/service.js"
 import { ensureMembershipSchema, getAdminMembershipCenter, upsertMembershipPlan } from "../membership/service.js"
@@ -43,6 +43,7 @@ import { publishOfferEvent, publishServiceCatalogEvent } from "../realtime/socke
 import adminBookingRoutes from "./admin-bookings.js"
 import whatsappAdminRoutes from "./whatsapp-admin.js"
 import { ensureBusinessSchema, getAdminBusinessProfile, updateBusinessProfile } from "../business/service.js"
+import { listLegalDocuments, resetLegalDocument, saveLegalDocument } from "../legal/service.js"
 import { ensureAgentSchema, getAgentUsageSummary } from "../agents/agent-log.js"
 import { isLlmConfigured, AGENT_MODEL } from "../agents/llm.js"
 import { AGENTS, SERVICE_CONTENT_AGENT } from "../agents/registry.js"
@@ -50,6 +51,7 @@ import { draftServiceContent, runConversationalAgent } from "../agents/runner.js
 import { assistantBurstRateLimit, assistantDailyRateLimit } from "../middleware/rate-limiters.js"
 
 const router = express.Router()
+router.param("id", rejectMalformedId)
 const OFFER_SEGMENTS = ["FREE", "BASIC", "PREMIUM"]
 
 
@@ -608,6 +610,35 @@ router.put("/business-profile", async (req, res) => {
   } catch (error) {
     if (error?.code === "BAD_REQUEST") return res.status(400).json({ error: error.message })
     throw error
+  }
+})
+
+// --- Legal pages (Privacy Policy, Terms & Conditions) -------------------------------------
+
+function legalError(res, error) {
+  if (error?.code === "BAD_REQUEST") return res.status(400).json({ error: error.message })
+  if (error?.code === "NOT_FOUND") return res.status(404).json({ error: "Not found" })
+  throw error
+}
+
+router.get("/legal", async (_req, res) => {
+  res.json({ documents: await listLegalDocuments() })
+})
+
+router.put("/legal/:slug", async (req, res) => {
+  try {
+    res.json({ document: await saveLegalDocument({ slug: req.params.slug, payload: req.body ?? {}, actorUserId: req.appUser.id }) })
+  } catch (error) {
+    return legalError(res, error)
+  }
+})
+
+// Restores the built-in text.
+router.delete("/legal/:slug", async (req, res) => {
+  try {
+    res.json({ document: await resetLegalDocument({ slug: req.params.slug, actorUserId: req.appUser.id }) })
+  } catch (error) {
+    return legalError(res, error)
   }
 })
 

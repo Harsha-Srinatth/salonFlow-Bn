@@ -15,7 +15,10 @@ function normalizeMembershipSegment(value) {
 }
 
 function toPercent(value) {
-  const num = Number(value ?? 0)
+  // Missing is invalid, not 0%: every caller is a full write, and treating an absent field as 0
+  // silently replaced the live global discount with "0%, always on".
+  if (value === undefined || value === null || `${value}`.trim() === "") return null
+  const num = Number(value)
   if (!Number.isFinite(num) || num < 0 || num > 100) return null
   return num
 }

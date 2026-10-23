@@ -1,7 +1,7 @@
 import express from "express"
 import { pool } from "../lib/db-pool.js"
 import { parseSelectableGender } from "../lib/gender.js"
-import { isValidFullName, normalizeName, parseDateOfBirth } from "../lib/validation.js"
+import { isValidFullName, normalizeName, parseDateOfBirth, rejectMalformedId } from "../lib/validation.js"
 import { USER_PROFILE_COLUMNS, toAppUserDto } from "../lib/user-dto.js"
 import { ensureMembershipSchema, getCustomerMembershipView } from "../membership/service.js"
 import { getMembershipPurchaseStatus, startMembershipCheckout, verifyMembershipPayment } from "../membership/purchases.js"
@@ -36,6 +36,7 @@ import { publishBookingEvent, publishPaymentEvent } from "../realtime/socket-gat
 import { getMarketingPreference, setMarketingPreference } from "../whatsapp/campaigns.js"
 
 const router = express.Router()
+router.param("id", rejectMalformedId)
 
 router.use(requireFirebaseAuth, requireAppRole("USER"))
 router.use(async (_req, _res, next) => {

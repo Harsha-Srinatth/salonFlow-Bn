@@ -80,6 +80,8 @@ import { SLOT_STEP_MINUTES } from "./constants.js"
 import { getSalonHours, minutesToLabel } from "../business/service.js"
 const NOTIFY_TIMEZONE = process.env.SALON_TIMEZONE ?? "Asia/Kolkata"
 
+const MAX_CUSTOMER_NAME_LENGTH = 120
+
 function formatNotifyDateTime(iso) {
   try {
     return new Date(iso).toLocaleString("en-IN", {
@@ -308,7 +310,9 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
   const legacyServiceId = `${payload.serviceId ?? ""}`.trim()
   const resolvedServiceIds = serviceIds.length ? serviceIds : legacyServiceId ? [legacyServiceId] : []
   if (customerName.length < 2) throw Object.assign(new Error("Customer name is required"), { code: "BAD_REQUEST" })
-  if (!isValidEmail(customerEmail)) throw Object.assign(new Error("Valid email is required"), { code: "BAD_REQUEST" })
+  // The columns hold 255; anything near that is pasted junk, and past it Postgres fails the insert as a 500.
+  if (customerName.length > MAX_CUSTOMER_NAME_LENGTH) throw Object.assign(new Error("Customer name is too long"), { code: "BAD_REQUEST" })
+  if (!isValidEmail(customerEmail) || customerEmail.length > 254) throw Object.assign(new Error("Valid email is required"), { code: "BAD_REQUEST" })
   if (!isValidPhone(customerPhone)) throw Object.assign(new Error("Valid phone is required"), { code: "BAD_REQUEST" })
   // A walk-in booking registers a customer account, so it has to ask the same
   // question signup does — otherwise reception keeps minting genderless accounts.
@@ -1065,6 +1069,9 @@ async function resolveStylistTransitionMiss({ bookingId, actorUserId, expected }
     throw Object.assign(new Error("Booking not found for stylist"), { code: "NOT_FOUND" })
   }
   if (normalizeBookingStatus(existing.status) === expected) return existing
+  if (expected === "STARTED" && normalizeBookingStatus(existing.status) === "CONFIRMED") {
+    throw Object.assign(new Error("This booking is for a later day; start it on the day of the appointment"), { code: "INVALID_TRANSITION" })
+  }
   throw Object.assign(new Error(`Booking is ${existing.status}; it cannot move to ${expected}`), { code: "INVALID_TRANSITION" })
 }
 
@@ -1135,6 +1142,9 @@ export async function recordReceptionPayment({ payload, actorUserId, publishPaym
   if (sourceType === "BOOKING" && !bookingId) throw Object.assign(new Error("bookingId is required for booking payment"), { code: "BAD_REQUEST" })
   if (sourceType !== "BOOKING" && !customerName) {
     throw Object.assign(new Error("customerName is required for walk-in payment"), { code: "BAD_REQUEST" })
+  }
+  if (customerName.length > MAX_CUSTOMER_NAME_LENGTH || customerEmail.length > 254 || customerPhone.length > 32) {
+    throw Object.assign(new Error("Customer details are too long"), { code: "BAD_REQUEST" })
   }
 
   // The balance check and the insert happen under a lock on the booking row. As two separate

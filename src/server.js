@@ -58,18 +58,21 @@ const host = "0.0.0.0"
 
 // Local dev servers are only trusted outside production: with `credentials: true`, any page
 // served from a developer's localhost could otherwise call the production API as the user.
+// Production trusts exactly FRONTEND_ORIGIN (required by env-check). No hosted origin is written
+// here: a retired preview domain (e.g. a deleted Vercel project) can be claimed by anyone, and a
+// trusted origin can read signed-in customers' data.
 const allowedOrigins = process.env.NODE_ENV === "production"
-  ? ["https://salonflow-eta.vercel.app"]
+  ? []
   : [
       "http://localhost:5173",
       "http://localhost:5178",
       "http://localhost:55000",
       "http://127.0.0.1:5173",
       "http://127.0.0.1:5178",
-      "https://salonflow-eta.vercel.app",
+      "http://127.0.0.1:55000",
     ]
 
-// Allow additional origins from env
+// Every deployed frontend origin comes from env
 if (process.env.FRONTEND_ORIGIN) {
   process.env.FRONTEND_ORIGIN
     .split(",")

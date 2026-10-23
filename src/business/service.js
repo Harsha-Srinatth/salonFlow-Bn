@@ -56,7 +56,8 @@ const TEXT_FIELDS = {
   lateArrivalPolicy: 1500,
   generalPolicy: 3000,
 }
-const URL_FIELDS = ["mapsUrl", "website", "instagram", "facebook", "youtube", "x", "privacyUrl", "termsUrl"]
+// Privacy Policy and Terms are the salon's own pages now (src/legal), not external links.
+const URL_FIELDS = ["mapsUrl", "website", "instagram", "facebook", "youtube", "x"]
 const MAX_FAQ = 25
 
 /** Fields the footer/assistant consider essential; reported to the admin when empty. */

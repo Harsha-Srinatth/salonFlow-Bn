@@ -44,6 +44,11 @@ export function assertProductionEnv(env = process.env) {
       message: "ANTHROPIC_API_KEY is unset: the support assistant runs in basic (rule-based) mode and admin AI tools are disabled.",
     })
   }
+  if (!["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"].every(name => `${env[name] ?? ""}`.trim())) {
+    console.warn("env_check_warning", {
+      message: "Cloudinary is not fully configured: admins cannot upload service photos.",
+    })
+  }
   if (!`${env.TRUST_PROXY ?? ""}`.trim()) {
     console.warn("env_check_warning", {
       message: "TRUST_PROXY is unset: behind a load balancer every client will share one IP for rate limiting.",

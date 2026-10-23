@@ -1005,6 +1005,10 @@ export async function markBookingStarted({ bookingId, stylistId, startedAt = new
         updated_by = $2,
         updated_at = NOW()
       WHERE id = $1 AND stylist_id = $2 AND status = 'CONFIRMED'
+        -- Only bookings for today (salon time). Starting a later day's booking by mistake would
+        -- let the overdue sweep auto-complete it within the hour: rewards and no cancellation
+        -- for a service that never happened.
+        AND starts_at < ${SALON_TOMORROW_START_SQL}
       RETURNING id, customer_name, customer_name_enc, customer_email, customer_email_enc, customer_phone, customer_phone_enc, service_name, stylist_id, starts_at, duration_minutes, service_items_json, total_amount, discount_amount, payable_amount, actual_start_at, completed_at, overtime_minutes, penalty_amount, invoice_number, status, created_by, created_at, updated_at
     `,
     [bookingId, stylistId, startedAt]

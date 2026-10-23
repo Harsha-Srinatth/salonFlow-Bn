@@ -3,6 +3,7 @@
  * the parent router). Promotions only go to customers who opted in; see whatsapp/campaigns.js.
  */
 import express from "express"
+import { rejectMalformedId } from "../lib/validation.js"
 import { createOfferCampaign, getCampaignStats, listCampaigns, previewOfferAudience } from "../whatsapp/campaigns.js"
 import { describeWhatsAppConfig, validateWhatsAppConfig, whatsappConfig } from "../whatsapp/config.js"
 import { otpDeliveryMode } from "../whatsapp/otp.js"
@@ -10,6 +11,7 @@ import { budgetReport } from "../whatsapp/budget.js"
 import { ensureWhatsAppSchema } from "../whatsapp/schema-init.js"
 
 const router = express.Router()
+router.param("id", rejectMalformedId)
 
 function sendError(res, error, label) {
   const status = Number(error?.status)

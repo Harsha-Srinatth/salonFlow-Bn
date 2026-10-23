@@ -8,8 +8,10 @@ import { salonDateString } from "./salon-time.js"
  * rules a name has to pass at signup are the same ones it has to pass on edit.
  */
 
+export const MAX_FULL_NAME_LENGTH = 120
+
 /**
- * Full-name rules for self-registration and profile edits: at least two words,
+ * Full-name rules for self-registration and profile edits: at least two words, at most 120 characters,
  * letters (plus ' . -) only, and a few anti-gibberish heuristics — no run of 4+
  * identical letters, and more than 3 distinct letters overall.
  *
@@ -18,7 +20,8 @@ import { salonDateString } from "./salon-time.js"
  */
 export function isValidFullName(name) {
   const normalized = normalizeName(name)
-  if (normalized.length < 4) return false
+  // Upper bound: users.name is varchar(255), and past it the insert failed as a 500.
+  if (normalized.length < 4 || normalized.length > MAX_FULL_NAME_LENGTH) return false
   if (normalized.split(" ").length < 2) return false
   if (!/^[A-Za-z][A-Za-z\s'.-]+$/.test(normalized)) return false
   const lettersOnly = normalized.replace(/[^A-Za-z]/g, "").toLowerCase()
@@ -101,4 +104,18 @@ export function calculateAge(dateOfBirth) {
   // Birthday not reached yet this year — compare the MM-DD tails.
   if (today.slice(5) < dob.slice(5)) age -= 1
   return age >= 0 ? age : null
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * `router.param("id", rejectMalformedId)`: every `:id` in the API is a uuid. A malformed one is a
+ * record that cannot exist, so answer 404 here instead of letting Postgres reject the cast inside
+ * a controller that reports every unexpected error as a 500.
+ *
+ * @type {import("express").RequestParamHandler}
+ */
+export function rejectMalformedId(req, res, next, value) {
+  if (UUID_PATTERN.test(`${value ?? ""}`)) return next()
+  return res.status(404).json({ error: "Not found", requestId: req.requestId })
 }

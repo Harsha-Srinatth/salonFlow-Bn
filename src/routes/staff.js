@@ -1,4 +1,5 @@
 import express from "express"
+import { rejectMalformedId } from "../lib/validation.js"
 import {
   completeStylistBookingController,
   downloadBookingInvoiceController,
@@ -13,6 +14,7 @@ import { queueLiveRateLimit } from "../middleware/rate-limiters.js"
 import { publishBookingEvent } from "../realtime/socket-gateway.js"
 
 const router = express.Router()
+router.param("id", rejectMalformedId)
 
 router.use(requireStaffSessionAuth, requireAppRole("STAFF"))
 router.use(async (_req, _res, next) => {
