@@ -42,13 +42,12 @@ import { ensureLoyaltySchema, runReferralSettlementSweep } from "./loyalty/servi
 import { isRazorpayConfigured, razorpayConfig } from "./payments/config.js"
 import { ensurePaymentsRuntime, runRazorpaySweep } from "./payments/service.js"
 import { runMembershipSweep } from "./membership/purchases.js"
-import { handleWebhookEvent as whatsappWebhookHandler, handleWebhookVerification as whatsappWebhookVerification } from "./whatsapp/webhook.js"
-import { startWhatsAppRuntime } from "./whatsapp/runtime.js"
+import { startSmsReminders } from "./sms/reminders.js"
 
 assertProductionEnv()
 
 let shuttingDown = false
-let stopWhatsApp = async () => {}
+let stopSmsReminders = async () => {}
 const BOOKING_SWEEP_SLOT_KEY = "sahasra:bookings:sweep-slot"
 
 const app = express()
@@ -143,9 +142,6 @@ app.use(
 // Razorpay signs the exact bytes it sends, so its webhook gets the raw body (no JSON parsing)
 // and must be registered before the global JSON parser below.
 app.post("/api/payments/razorpay/webhook", express.raw({ type: "*/*", limit: "256kb" }), attachRequestId, razorpayWebhookHandler)
-// Meta signs the raw bytes too (X-Hub-Signature-256), so the WhatsApp webhook is raw as well.
-app.get("/api/whatsapp/webhook", whatsappWebhookVerification)
-app.post("/api/whatsapp/webhook", express.raw({ type: "*/*", limit: "1mb" }), attachRequestId, whatsappWebhookHandler)
 
 app.use("/api/admin/services/upload-image", express.json({ limit: "12mb" }))
 app.use(express.json({ limit: "256kb" }))
@@ -261,8 +257,8 @@ async function shutdown(signal) {
   setTimeout(() => process.exit(1), Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 10_000)).unref()
   try {
     await new Promise(resolve => io.close(resolve)) // also closes the underlying HTTP server
-    // Let an in-flight WhatsApp send finish and record its result before the pool closes.
-    await stopWhatsApp().catch(error => console.error("whatsapp_stop_failed", error))
+    // Let an in-flight SMS send finish and record its result before the pool closes.
+    await stopSmsReminders().catch(error => console.error("sms_stop_failed", error))
     await pool.end()
     console.log("shutdown_complete")
     process.exit(0)
@@ -332,12 +328,11 @@ try {
   console.error("queue_schema_bootstrap_failed", error)
 }
 
-// WhatsApp: outbox worker (confirmations, reminders, offers) and retention. A failure
-// here leaves WhatsApp off but never stops the API.
+// SMS appointment reminders. A failure here leaves reminders off but never stops the API.
 try {
-  stopWhatsApp = await startWhatsAppRuntime()
+  stopSmsReminders = await startSmsReminders()
 } catch (error) {
-  console.error("whatsapp_runtime_start_failed", error)
+  console.error("sms_reminders_start_failed", error)
 }
 
 if (isRazorpayConfigured()) {

@@ -1,4 +1,4 @@
-import { validateWhatsAppConfig, whatsappConfig } from "../whatsapp/config.js"
+import { smsConfig, validateSmsConfig } from "../sms/config.js"
 
 /**
  * Fail fast on a mis-configured production deploy.
@@ -54,9 +54,9 @@ export function assertProductionEnv(env = process.env) {
       message: "TRUST_PROXY is unset: behind a load balancer every client will share one IP for rate limiting.",
     })
   }
-  // WhatsApp is optional, but once WHATSAPP_ENABLED=true it must be complete: a half-set
-  // configuration would accept bookings and silently never send their messages.
-  problems.push(...validateWhatsAppConfig(whatsappConfig(env)))
+  // SMS is optional, but once SMS_ENABLED=true it must be complete: a half-set
+  // configuration would accept bookings and silently never send their reminders.
+  problems.push(...validateSmsConfig(smsConfig(env)))
   if (problems.length) {
     console.error("env_check_failed", problems)
     throw new Error(`Refusing to start: ${problems.join("; ")}`)

@@ -1,12 +1,12 @@
 // Regression tests for the 0.0.0.1 pre-release audit. Same isolated database and mocks as the
-// WhatsApp suite (sahasra_wa_test, never the development database).
-import "../whatsapp/setup.js"
+// backend suites (sahasra_wa_test, never the development database).
+import "../helpers/setup.js"
 import test from "node:test"
 import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
 import express from "express"
 import cookieParser from "cookie-parser"
-import { createUser, insertBooking, pool, prepareDatabase, resetData } from "../whatsapp/fixtures.js"
+import { createUser, insertBooking, pool, prepareDatabase, resetData } from "../helpers/fixtures.js"
 import staffRoutes from "../../src/routes/staff.js"
 import { signStaffAccessToken } from "../../src/lib/tokens.js"
 import { createReceptionBooking, recordReceptionPayment } from "../../src/bookings/service.js"

@@ -1,9 +1,9 @@
 // The salon's own Privacy Policy / Terms & Conditions (GET /api/public/legal/:slug, admin edit).
-import "../whatsapp/setup.js"
+import "../helpers/setup.js"
 import test from "node:test"
 import assert from "node:assert/strict"
 import express from "express"
-import { createUser, pool, prepareDatabase, resetData } from "../whatsapp/fixtures.js"
+import { createUser, pool, prepareDatabase, resetData } from "../helpers/fixtures.js"
 import publicRoutes from "../../src/routes/public.js"
 import { ensureLegalSchema, getLegalDocument, resetLegalDocument, saveLegalDocument } from "../../src/legal/service.js"
 import { DEFAULT_EFFECTIVE_DATE } from "../../src/legal/defaults.js"

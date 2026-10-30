@@ -4,9 +4,7 @@ import { ensureUserProfileSchema } from "../../src/auth/schema-init.js"
 import { ensureBookingsSchema } from "../../src/bookings/schema-init.js"
 import { createBooking } from "../../src/bookings/repository.js"
 import { ensureOfferSchema } from "../../src/offers/service.js"
-import { ensureWhatsAppSchema } from "../../src/whatsapp/schema-init.js"
-import { prepareWhatsAppNotifications } from "../../src/whatsapp/notifications.js"
-import "../../src/whatsapp/runtime.js"
+import { ensureSmsSchema, prepareSmsReminders } from "../../src/sms/reminders.js"
 
 export { pool }
 
@@ -14,14 +12,13 @@ export async function prepareDatabase() {
   await ensureUserProfileSchema()
   await ensureBookingsSchema()
   await ensureOfferSchema()
-  await ensureWhatsAppSchema()
-  await prepareWhatsAppNotifications()
+  await ensureSmsSchema()
+  await prepareSmsReminders()
 }
 
 export async function resetData() {
   await pool.query(`
-    TRUNCATE whatsapp_messages, whatsapp_otp_challenges, whatsapp_contacts, whatsapp_webhook_events, whatsapp_campaigns,
-             offer_global_discounts, offer_service_discounts, offer_membership_service_discounts, offer_combos
+    TRUNCATE sms_messages, offer_global_discounts, offer_service_discounts, offer_membership_service_discounts, offer_combos
     CASCADE
   `)
   await pool.query(`DELETE FROM bookings`)
@@ -67,11 +64,11 @@ export async function insertBooking({ customer, hoursAhead = 30, stylistId = nul
 }
 
 export async function messages(where = "TRUE", values = []) {
-  const { rows } = await pool.query(`SELECT * FROM whatsapp_messages WHERE ${where} ORDER BY scheduled_for`, values)
+  const { rows } = await pool.query(`SELECT * FROM sms_messages WHERE ${where} ORDER BY scheduled_for`, values)
   return rows
 }
 
 /** Makes every pending message due now (simulates time passing). */
 export async function makeAllDue() {
-  await pool.query(`UPDATE whatsapp_messages SET next_attempt_at = NOW() - interval '1 second' WHERE status = 'PENDING'`)
+  await pool.query(`UPDATE sms_messages SET next_attempt_at = NOW() - interval '1 second' WHERE status = 'PENDING'`)
 }

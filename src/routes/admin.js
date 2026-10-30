@@ -41,7 +41,6 @@ import { ensureQueueSchema } from "../queue/schema-init.js"
 import { queueLiveRateLimit } from "../middleware/rate-limiters.js"
 import { publishOfferEvent, publishServiceCatalogEvent } from "../realtime/socket-gateway.js"
 import adminBookingRoutes from "./admin-bookings.js"
-import whatsappAdminRoutes from "./whatsapp-admin.js"
 import { ensureBusinessSchema, getAdminBusinessProfile, updateBusinessProfile } from "../business/service.js"
 import { listLegalDocuments, resetLegalDocument, saveLegalDocument } from "../legal/service.js"
 import { ensureAgentSchema, getAgentUsageSummary } from "../agents/agent-log.js"
@@ -137,7 +136,6 @@ router.use(async (_req, _res, next) => {
   }
 })
 router.use("/bookings", adminBookingRoutes)
-router.use("/whatsapp", whatsappAdminRoutes)
 // Any successful staff write (create, edit, shifts, leaves, delete) can change who is bookable,
 // so drop the cached stylist roster once the response has gone out.
 router.use("/staff", (req, res, next) => {

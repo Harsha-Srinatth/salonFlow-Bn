@@ -11,7 +11,7 @@ import { CUSTOMER_CANCELLATION_POLICY_RULES } from "../bookings/cancellation-pol
  */
 
 /** Effective date of the built-in text. Change it whenever the defaults below change. */
-export const DEFAULT_EFFECTIVE_DATE = "2026-10-23"
+export const DEFAULT_EFFECTIVE_DATE = "2026-10-30"
 
 export const LEGAL_DOCUMENTS = {
   privacy: { title: "Privacy Policy", summary: "How we collect, use, share and protect your personal information." },
@@ -59,7 +59,7 @@ We process personal information in line with the Digital Personal Data Protectio
 ### Memberships, offers and rewards
 - Your membership plan and its expiry date, referral code, who referred you, wallet balance and reward cards.
 ### Messages and feedback
-- WhatsApp messages we send you and their delivery status, and whether you have opted in to or out of offers.
+- SMS appointment reminders we send you and whether they were sent.
 - Ratings, comments and feedback you give about a visit.
 - Questions you type into our support assistant.
 ### Technical information
@@ -75,14 +75,14 @@ We process personal information in line with the Digital Personal Data Protectio
 - To keep the service secure, prevent fraud and fix problems.
 - To meet our legal, tax and accounting obligations.
 
-We send promotional offers on WhatsApp only if you have opted in. You can opt out at any time from your profile, or by replying STOP to any of our WhatsApp messages.
+We send appointment reminders by SMS for bookings you make. We do not send promotional SMS.
 
 ## Who we share information with
 We share information only as needed to run the service, and never sell it.
 - Salon staff: receptionists and stylists see the bookings they need to handle; the salon's administrators can see bookings, payments and feedback.
 - Amazon Web Services: hosts our application and database (see "Where your information is stored").
-- Google Firebase: Google sign-in and password-reset emails.
-- Meta (WhatsApp Business Platform): delivers our WhatsApp messages, including sign-in codes.
+- Google Firebase: Google sign-in, password-reset emails and the SMS codes that confirm your mobile number.
+- MSG91 (Walkover Web Solutions): delivers our SMS appointment reminders.
 - Razorpay: processes online payments and refunds.
 - Cloudinary: stores the photos of our services. It does not receive customer information.
 - Anthropic: when the AI support assistant is switched on, the questions you type are sent to Anthropic's API to generate a reply.
@@ -110,14 +110,13 @@ No online service can be completely secure. If a breach affects your personal in
 - Your account information is kept while your account is active and deleted when you ask us to close it, apart from the records below.
 - Booking, invoice and payment records are kept for as long as tax and accounting law requires. Removing a booking from your history hides it from your view but keeps the record.
 - In-app notifications are deleted 90 days after you read them, and all of them after 365 days.
-- WhatsApp sign-in codes expire after a few minutes and are stored only in a form that cannot be read back.
 
 ## Your rights
 Under applicable law you can ask us to:
 - give you a summary of the personal information we hold about you and how we use it;
 - correct or complete information that is inaccurate. You can update your name, gender and date of birth in your profile at any time;
 - erase your information and close your account, apart from records we must keep by law;
-- withdraw consent you gave, such as consent to WhatsApp offers;
+- withdraw consent you gave;
 - nominate another person to exercise these rights if you die or become unable to.
 
 To make a request or raise a complaint, email ${c.email}. We may need to verify your identity first, and we will reply within a reasonable time. If you are not satisfied with our response, you can complain to the Data Protection Board of India.
@@ -156,7 +155,7 @@ You can use the website and app to browse our services and prices, book appointm
 
 ## Your account
 - Give accurate details, and keep your name, phone number and email address up to date.
-- We confirm your mobile number with a code sent on WhatsApp. Keep your password and codes private, and do not share your account.
+- We confirm your mobile number with a code sent by SMS. Keep your password and codes private, and do not share your account.
 - Tell us at once if you think someone else has used your account.
 - You are responsible for bookings made from your account.
 
@@ -205,7 +204,7 @@ Your feedback must be honest and must not be offensive. We may reply to feedback
 Answers from the support assistant are for general information and can be wrong. The prices, times and policies shown in the app and confirmed by the salon apply.
 
 ## Third-party services
-We use other companies to provide parts of the service, including Razorpay for payments, Google for sign-in and WhatsApp for messages. Their own terms apply when you use them.
+We use other companies to provide parts of the service, including Razorpay for payments, Google for sign-in and MSG91 for SMS reminders. Their own terms apply when you use them.
 
 ## Availability of the service
 We work to keep the website and app available, but we cannot promise it will be uninterrupted or error-free. We may pause it for maintenance or updates.
