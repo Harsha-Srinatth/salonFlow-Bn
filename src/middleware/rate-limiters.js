@@ -81,6 +81,30 @@ export const passwordResetRequestRateLimit = createLimiter({
   limit: Number(process.env.RATE_PWRESET_REQUEST_MAX ?? 5),
 })
 
+/** `POST /api/auth/register`: each call costs a bcrypt hash and may send an email. */
+export const registerRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_REGISTER_WINDOW_MS ?? 60 * 60 * 1000),
+  limit: Number(process.env.RATE_REGISTER_MAX ?? 10),
+})
+
+/** `POST /api/auth/resend-verification`. Each account also has its own limit in auth/email-accounts.js. */
+export const resendVerificationRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_RESEND_VERIFICATION_WINDOW_MS ?? 60 * 60 * 1000),
+  limit: Number(process.env.RATE_RESEND_VERIFICATION_MAX ?? 5),
+})
+
+/** `POST /api/auth/verify-email` and the reset-link check: slows guessing, though tokens are 256 random bits. */
+export const emailTokenRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_EMAIL_TOKEN_WINDOW_MS ?? 60 * 60 * 1000),
+  limit: Number(process.env.RATE_EMAIL_TOKEN_MAX ?? 30),
+})
+
+/** Unsubscribe links, opened by people and POSTed by mail providers, so deliberately generous. */
+export const unsubscribeRateLimit = createLimiter({
+  windowMs: Number(process.env.RATE_UNSUBSCRIBE_WINDOW_MS ?? 60 * 60 * 1000),
+  limit: Number(process.env.RATE_UNSUBSCRIBE_MAX ?? 120),
+})
+
 /**
  * Limits `POST /api/auth/staff/verify-firebase-phone` (Firebase ID token validation + setup JWT issuance).
  */

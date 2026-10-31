@@ -37,6 +37,7 @@ import {
   saveLoyaltySettings,
 } from "../loyalty/service.js"
 import { getOperationalQueueBoardController } from "../queue/controller.js"
+import emailAdminRoutes from "./email-admin.js"
 import { ensureQueueSchema } from "../queue/schema-init.js"
 import { queueLiveRateLimit } from "../middleware/rate-limiters.js"
 import { publishOfferEvent, publishServiceCatalogEvent } from "../realtime/socket-gateway.js"
@@ -136,6 +137,7 @@ router.use(async (_req, _res, next) => {
   }
 })
 router.use("/bookings", adminBookingRoutes)
+router.use("/email", emailAdminRoutes)
 // Any successful staff write (create, edit, shifts, leaves, delete) can change who is bookable,
 // so drop the cached stylist roster once the response has gone out.
 router.use("/staff", (req, res, next) => {

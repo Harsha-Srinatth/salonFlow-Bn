@@ -70,6 +70,14 @@ export const users = pgTable("users", {
     isUnderReview: boolean("is_under_review").notNull().default(false),
     accountStatus: accountStatusEnum("account_status").notNull().default("ACTIVE"),
     passwordHash: varchar("password_hash", { length: 255 }),
+    // Set only while an email registration waits for its link. See auth/email-accounts.js.
+    pendingEmailSignupAt: timestamp("pending_email_signup_at", { withTimezone: true }),
+    pendingSignupMeta: jsonb("pending_signup_meta"),
+    emailBookingUpdates: boolean("email_booking_updates").notNull().default(true),
+    marketingEmailConsent: boolean("marketing_email_consent").notNull().default(false),
+    marketingEmailConsentAt: timestamp("marketing_email_consent_at", { withTimezone: true }),
+    marketingEmailConsentSource: varchar("marketing_email_consent_source", { length: 40 }),
+    marketingEmailUnsubscribedAt: timestamp("marketing_email_unsubscribed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, table => [

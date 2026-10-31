@@ -6,6 +6,7 @@
  *    Only the connection host/user/password are read from bn/.env; no other secret from it
  *    is loaded into the test process.
  *  - Sets fake SMS credentials and installs a fetch mock, so no request can reach MSG91.
+ *  - Sets fake SES settings and installs a fake client, so no request can reach AWS.
  */
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
@@ -54,12 +55,71 @@ export const TEST_ENV = {
   MSG91_REMINDER_TEMPLATE_ID: "test-template-id",
   SMS_WORKER_BATCH_SIZE: "50",
 }
-for (const key of Object.keys(process.env)) {
-  if (key.startsWith("SMS_") || key.startsWith("MSG91_")) delete process.env[key]
+export const TEST_EMAIL_ENV = {
+  EMAIL_ENABLED: "true",
+  EMAIL_VERIFICATION_ENABLED: "true",
+  PHONE_VERIFICATION_ENABLED: "false",
+  EMAIL_REMINDERS_ENABLED: "true",
+  EMAIL_MARKETING_ENABLED: "true",
+  AWS_SES_FROM_EMAIL: "support@sahasra-test.in",
+  AWS_SES_CONFIGURATION_SET: "test-transactional",
+  AWS_SES_MARKETING_CONFIGURATION_SET: "test-marketing",
+  AWS_SES_REPLY_TO: "team@sahasra-test.in",
+  AWS_SES_EVENTS_TOPIC_ARN: "arn:aws:sns:ap-southeast-2:000000000000:test-topic",
+  APP_PUBLIC_URL: "https://sahasra-test.in",
+  API_PUBLIC_URL: "https://api.sahasra-test.in",
+  EMAIL_LINK_SECRET: "test-link-secret-for-backend-suite-0123456789",
+  EMAIL_WORKER_SEND_INTERVAL_MS: "0",
+  EMAIL_REQUEST_COOLDOWN_SECONDS: "0",
+  EMAIL_REQUEST_HOURLY_LIMIT: "100",
+  EMAIL_WORKER_BATCH_SIZE: "50",
+  RATE_REGISTER_MAX: "1000",
+  RATE_RESEND_VERIFICATION_MAX: "1000",
+  RATE_EMAIL_TOKEN_MAX: "1000",
+  RATE_PWRESET_REQUEST_MAX: "1000",
+  RATE_PWRESET_COMPLETE_MAX: "1000",
+  RATE_LOGIN_MAX: "1000",
 }
-Object.assign(process.env, TEST_ENV)
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith("SMS_") || key.startsWith("MSG91_") || key.startsWith("EMAIL_") || key.startsWith("AWS_SES_") || key.startsWith("AWS_ACCESS")) delete process.env[key]
+}
+delete process.env.PHONE_VERIFICATION_ENABLED
+delete process.env.PASSWORD_RESET_TOKEN_EXPIRY
+Object.assign(process.env, TEST_ENV, TEST_EMAIL_ENV)
 
 const { setSmsFetchForTests } = await import("../../src/sms/client.js")
+const { setSesClientForTests } = await import("../../src/email/ses-provider.js")
+
+/** Every SES request made during a test, and a programmable responder. */
+export const sesApi = {
+  calls: [],
+  respond: null,
+  reset() {
+    this.calls = []
+    this.respond = null
+  },
+}
+let sesCounter = 0
+setSesClientForTests({
+  async send(command) {
+    const input = command.input
+    if (!input.Destination) return { ProductionAccessEnabled: false, SendingEnabled: true, SendQuota: { Max24HourSend: 200, MaxSendRate: 1, SentLast24Hours: 0 } }
+    sesApi.calls.push({
+      to: input.Destination.ToAddresses[0],
+      from: input.FromEmailAddress,
+      replyTo: input.ReplyToAddresses,
+      configurationSet: input.ConfigurationSetName,
+      subject: input.Content.Simple.Subject.Data,
+      html: input.Content.Simple.Body.Html.Data,
+      text: input.Content.Simple.Body.Text.Data,
+      headers: input.Content.Simple.Headers ?? [],
+      tags: input.EmailTags,
+    })
+    if (sesApi.respond) return sesApi.respond(input)
+    sesCounter += 1
+    return { MessageId: `ses-${sesCounter}` }
+  },
+})
 
 /** Every SMS API request made during a test, and a programmable responder. */
 export const smsApi = {

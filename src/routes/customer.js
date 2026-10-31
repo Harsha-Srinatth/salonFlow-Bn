@@ -28,6 +28,8 @@ import {
 } from "../bookings/controller.js"
 import { ensureBookingsSchema } from "../bookings/schema-init.js"
 import { ensureUserProfileSchema } from "../auth/schema-init.js"
+import { ensureEmailSchema } from "../email/schema.js"
+import { getEmailPreferences, updateEmailPreferences } from "../email/marketing.js"
 import { getLiveQueueBoardController, getMyQueuePositionController } from "../queue/controller.js"
 import { ensureQueueSchema } from "../queue/schema-init.js"
 import { requireAppRole, requireFirebaseAuth } from "../middleware/auth.js"
@@ -178,6 +180,18 @@ router.post("/bookings/:id/feedback", async (req, res) => {
     console.error("Failed to create customer feedback", error)
     return res.status(500).json({ error: "Internal server error" })
   }
+})
+
+/** GET/PATCH /api/customer/email-preferences: promotional emails and booking updates, kept separate. */
+router.get("/email-preferences", async (req, res) => {
+  await ensureEmailSchema()
+  res.json({ preferences: await getEmailPreferences(req.appUser.id) })
+})
+
+router.patch("/email-preferences", async (req, res) => {
+  await ensureEmailSchema()
+  const { marketingEmails, bookingEmails } = req.body ?? {}
+  res.json({ preferences: await updateEmailPreferences(req.appUser.id, { marketingEmails, bookingEmails }) })
 })
 
 /**

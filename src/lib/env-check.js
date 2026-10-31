@@ -1,3 +1,4 @@
+import { emailConfig, validateEmailConfig } from "../email/config.js"
 import { smsConfig, validateSmsConfig } from "../sms/config.js"
 
 /**
@@ -57,6 +58,8 @@ export function assertProductionEnv(env = process.env) {
   // SMS is optional, but once SMS_ENABLED=true it must be complete: a half-set
   // configuration would accept bookings and silently never send their reminders.
   problems.push(...validateSmsConfig(smsConfig(env)))
+  // Same for email: registration depends on it once EMAIL_VERIFICATION_ENABLED is on.
+  problems.push(...validateEmailConfig(emailConfig(env)))
   if (problems.length) {
     console.error("env_check_failed", problems)
     throw new Error(`Refusing to start: ${problems.join("; ")}`)

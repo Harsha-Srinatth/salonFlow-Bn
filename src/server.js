@@ -21,6 +21,7 @@ import receptionRoutes from "./routes/reception.js"
 import staffRoutes from "./routes/staff.js"
 import publicRoutes from "./routes/public.js"
 import assistantRoutes from "./routes/assistant.js"
+import emailRoutes from "./routes/email.js"
 
 import {
   initSocketGateway,
@@ -43,11 +44,14 @@ import { isRazorpayConfigured, razorpayConfig } from "./payments/config.js"
 import { ensurePaymentsRuntime, runRazorpaySweep } from "./payments/service.js"
 import { runMembershipSweep } from "./membership/purchases.js"
 import { startSmsReminders } from "./sms/reminders.js"
+import { startEmailService } from "./email/service.js"
+import { sesWebhookHandler } from "./email/events.js"
 
 assertProductionEnv()
 
 let shuttingDown = false
 let stopSmsReminders = async () => {}
+let stopEmailService = async () => {}
 const BOOKING_SWEEP_SLOT_KEY = "sahasra:bookings:sweep-slot"
 
 const app = express()
@@ -143,6 +147,9 @@ app.use(
 // and must be registered before the global JSON parser below.
 app.post("/api/payments/razorpay/webhook", express.raw({ type: "*/*", limit: "256kb" }), attachRequestId, razorpayWebhookHandler)
 
+// SNS posts JSON as text/plain, and its signature covers fields inside that JSON.
+app.post("/api/webhooks/ses", express.text({ type: "*/*", limit: "256kb" }), attachRequestId, sesWebhookHandler)
+
 app.use("/api/admin/services/upload-image", express.json({ limit: "12mb" }))
 app.use(express.json({ limit: "256kb" }))
 app.use(cookieParser())
@@ -179,6 +186,7 @@ app.use("/api/staff", staffRoutes)
 app.use("/api/notifications", notificationRoutes)
 app.use("/api/public", publicRoutes)
 app.use("/api/assistant", assistantRoutes)
+app.use("/api/email", emailRoutes)
 
 // Postgres errors that mean "the client sent something malformed" rather than
 // "the server broke": invalid uuid/number/timestamp text, out-of-range values.
@@ -259,6 +267,7 @@ async function shutdown(signal) {
     await new Promise(resolve => io.close(resolve)) // also closes the underlying HTTP server
     // Let an in-flight SMS send finish and record its result before the pool closes.
     await stopSmsReminders().catch(error => console.error("sms_stop_failed", error))
+    await stopEmailService().catch(error => console.error("email_stop_failed", error))
     await pool.end()
     console.log("shutdown_complete")
     process.exit(0)
@@ -333,6 +342,13 @@ try {
   stopSmsReminders = await startSmsReminders()
 } catch (error) {
   console.error("sms_reminders_start_failed", error)
+}
+
+// Email outbox worker. A failure here leaves email off but never stops the API.
+try {
+  stopEmailService = await startEmailService()
+} catch (error) {
+  console.error("email_service_start_failed", error)
 }
 
 if (isRazorpayConfigured()) {

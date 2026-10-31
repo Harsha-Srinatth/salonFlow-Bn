@@ -224,6 +224,21 @@ export const ensureUserProfileSchema = createSchemaEnsurer({
       AUTH_PROVIDER_UNKNOWN,
     ])
 
+    // Set only by email registration, cleared when the address is confirmed. This, not
+    // `account_status`, is what "waiting for the email link" means: reception creates accounts
+    // as PENDING_VERIFICATION too, and those are real customers (see auth/email-accounts.js).
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_email_signup_at TIMESTAMPTZ`)
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_signup_meta JSONB`)
+    await client.query(`CREATE INDEX IF NOT EXISTS users_pending_email_signup_idx ON users (pending_email_signup_at) WHERE pending_email_signup_at IS NOT NULL`)
+    // Marketing consent is its own decision with its own record: off until the customer says
+    // otherwise, and separate from the booking updates they can turn off independently.
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_booking_updates BOOLEAN NOT NULL DEFAULT TRUE`)
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_email_consent BOOLEAN NOT NULL DEFAULT FALSE`)
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_email_consent_at TIMESTAMPTZ`)
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_email_consent_source VARCHAR(40)`)
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_email_unsubscribed_at TIMESTAMPTZ`)
+    await client.query(`CREATE INDEX IF NOT EXISTS users_marketing_consent_idx ON users (marketing_email_consent) WHERE marketing_email_consent = TRUE`)
+
     // Last, and inside the same advisory-locked transaction as the DDL above:
     // a second instance booting concurrently blocks on the lock, then sees the
     // committed marker and skips, so the rewrite happens exactly once fleet-wide.

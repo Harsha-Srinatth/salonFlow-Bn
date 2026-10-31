@@ -21,6 +21,7 @@ import {
 } from "../lib/firebase-identity-toolkit.js"
 import { requireFirebaseAuth, requireFreshFirebaseToken } from "../middleware/auth.js"
 import { ensureUserProfileSchema } from "../auth/schema-init.js"
+import { ensureEmailSchema } from "../email/schema.js"
 import { GENDER_UNSPECIFIED, normalizeCustomerGender, parseSelectableGender } from "../lib/gender.js"
 import {
   AUTH_PROVIDER_GOOGLE,
@@ -41,6 +42,9 @@ import {
   emailExistsRateLimit,
   passwordResetCompleteRateLimit,
   passwordResetRequestRateLimit,
+  emailTokenRateLimit,
+  registerRateLimit,
+  resendVerificationRateLimit,
   staffFirebaseVerifyRateLimit,
   staffSetPasswordRateLimit,
 } from "../middleware/rate-limiters.js"
@@ -49,8 +53,28 @@ import { invalidateStylistRoster } from "../lib/catalog-cache.js"
 import { isSessionTokenLive } from "../middleware/auth.js"
 import { signStaffAccessToken, signStaffSetupToken, verifyStaffAccessToken, verifyStaffSetupToken } from "../lib/tokens.js"
 import { verifyFirebaseToken } from "../lib/firebase-admin.js"
+import { emailConfig, publicAuthConfig } from "../email/config.js"
+import { setMarketingConsent } from "../email/marketing.js"
+import {
+  checkPasswordResetToken,
+  claimPendingSignup,
+  completePasswordReset,
+  isValidPhoneNumber,
+  registerCustomer,
+  requestPasswordReset,
+  resendVerification,
+  verifyEmailToken,
+  welcomeNewAccount,
+} from "../auth/email-accounts.js"
 const isProduction = process.env.NODE_ENV === "production"
 const router = express.Router()
+
+let unknownUserHashPromise = null
+/** A real bcrypt hash of a random value: compared against when the address is not registered. */
+function unknownUserHash() {
+  unknownUserHashPromise ??= bcrypt.hash(randomBytes(24).toString("hex"), 12)
+  return unknownUserHashPromise
+}
 
 /**
  * Normalizes email for comparisons so DB rows with accidental spaces still match Firebase / login input.
@@ -86,7 +110,7 @@ async function findDbUser({ firebaseUid, email, phone }) {
   }
   if (!conditions.length) return null
   const sql = `
-    SELECT ${USER_PROFILE_COLUMNS}, firebase_uid, password_hash
+    SELECT ${USER_PROFILE_COLUMNS}, firebase_uid, password_hash, pending_email_signup_at
     FROM users
     WHERE ${conditions.join(" OR ")}
     ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
@@ -109,7 +133,7 @@ async function phoneExistsInDb(phone) {
 }
 
 /**
- * Decides whether a decoded Firebase ID token proves the two things registration requires.
+ * Decides whether a decoded Firebase ID token proves what registration requires.
  *
  * Both signals are claims Firebase itself signs, and neither can be produced without the
  * user completing the corresponding challenge:
@@ -126,16 +150,21 @@ async function phoneExistsInDb(phone) {
  * taken from the claim, and a header that disagrees with it means the browser verified one
  * number and asked to register another.
  *
+ * With PHONE_VERIFICATION_ENABLED off the phone half is not asked for: the number is stored as
+ * typed and `phone_verified` stays false, unless a claim really does prove it. The email half
+ * always applies. Turning the flag back on restores the original rule without other changes.
+ *
  * @param {{ email_verified?: boolean, phone_number?: string }} firebase Decoded claims
  * @param {string} requestedPhone E.164 the client asked to register
- * @returns {{ status: number, error: string, reason: string } | null} null when both factors hold
+ * @param {{ phoneRequired?: boolean }} [options]
+ * @returns {{ status: number, error: string, reason: string } | null} null when the factors hold
  */
-function describeRegistrationVerificationFailure(firebase, requestedPhone) {
+function describeRegistrationVerificationFailure(firebase, requestedPhone, { phoneRequired = true } = {}) {
   const verifiedPhone = typeof firebase.phone_number === "string" ? firebase.phone_number.trim() : ""
-  if (!verifiedPhone) {
+  if (phoneRequired && !verifiedPhone) {
     return { status: 403, error: "PHONE_NOT_VERIFIED", reason: "phone_not_verified" }
   }
-  if (requestedPhone && requestedPhone.trim() !== verifiedPhone) {
+  if (requestedPhone && verifiedPhone && requestedPhone.trim() !== verifiedPhone) {
     return { status: 400, error: "PHONE_MISMATCH", reason: "phone_claim_mismatch" }
   }
   if (!firebase.email) {
@@ -253,6 +282,21 @@ async function handlePostSession(req, res) {
     phone: verifiedPhone,
   })
 
+  // A signup still waiting for its email link. Only proof of that mailbox can finish it: a
+  // verified-phone match does not, because the number on a pending signup was never confirmed.
+  if (dbUser?.pending_email_signup_at) {
+    const provesThisMailbox =
+      firebase.email_verified === true && normalizeEmailForLookup(firebase.email) === normalizeEmailForLookup(dbUser.email)
+    if (!provesThisMailbox) {
+      auditAuthAsync("auth", "session_sync_denied", { ip, reason: "pending_email_signup", userId: dbUser.id })
+      return res.status(403).json({ error: "EMAIL_NOT_VERIFIED" })
+    }
+    await claimPendingSignup(dbUser.id, firebase)
+    const claimed = await findDbUser({ firebaseUid: firebase.uid })
+    auditAuthAsync("auth", "pending_signup_claimed", { ip, userId: dbUser.id, firebaseUid: firebase.uid })
+    return res.json({ user: toAppUserDto(claimed) })
+  }
+
   if (dbUser && !dbUser.firebase_uid) {
     await pool.query("UPDATE users SET firebase_uid = $1, updated_at = NOW() WHERE id = $2 AND firebase_uid IS NULL", [
       firebase.uid,
@@ -271,8 +315,11 @@ async function handlePostSession(req, res) {
       auditAuthAsync("auth", "session_register_denied", { ip, reason: "no_account_for_phone", firebaseUid: firebase.uid })
       return res.status(404).json({ error: "ACCOUNT_NOT_FOUND" })
     }
-    // Both factors, checked against signed token claims, before anything is written.
-    const verificationFailure = describeRegistrationVerificationFailure(firebase, requestedPhone)
+    // Checked against signed token claims, before anything is written.
+    const { phoneVerificationEnabled } = emailConfig()
+    const verificationFailure = describeRegistrationVerificationFailure(firebase, requestedPhone, {
+      phoneRequired: phoneVerificationEnabled,
+    })
     if (verificationFailure) {
       auditAuthAsync("auth", "session_register_denied", {
         ip,
@@ -293,6 +340,14 @@ async function handlePostSession(req, res) {
       return res.status(400).json({ error: "Please select your gender to complete registration" })
     }
     const resolvedEmail = firebase.email ?? ""
+    // `verifiedPhone` over the client header: the header is whatever the browser typed, the
+    // claim is the number Firebase actually delivered an SMS to. The typed number is only used
+    // with phone verification off, and is then stored as unverified.
+    const resolvedPhone = verifiedPhone || requestedPhone.trim()
+    if (!verifiedPhone) {
+      if (!isValidPhoneNumber(resolvedPhone)) return res.status(400).json({ error: "Please enter a valid phone number." })
+      if (await phoneExistsInDb(resolvedPhone)) return res.status(409).json({ error: "PHONE_IN_USE" })
+    }
     // The signup password reaches Postgres here and nowhere else. Without it the
     // row lands with a NULL `password_hash`, and the account the customer just
     // created rejects its own password at login with SET_PASSWORD_REQUIRED —
@@ -317,12 +372,10 @@ async function handlePostSession(req, res) {
           name, email, phone, gender, firebase_uid, role, latitude, longitude, account_status,
           email_verified, phone_verified, password_hash, auth_provider
         )
-        VALUES ($1, $2, $3, $4, $5, $6, 0, 0, 'ACTIVE', TRUE, TRUE, $7, $8)
+        VALUES ($1, $2, $3, $4, $5, $6, 0, 0, 'ACTIVE', TRUE, $9, $7, $8)
         RETURNING ${USER_PROFILE_COLUMNS}
       `,
-      // `verifiedPhone` over the client header: the header is whatever the browser
-      // typed, the claim is the number Firebase actually delivered an SMS to.
-      [requestedName, resolvedEmail, verifiedPhone, requestedGender, firebase.uid, requestedRole, signupPasswordHash, authProvider]
+      [requestedName, resolvedEmail, resolvedPhone, requestedGender, firebase.uid, requestedRole, signupPasswordHash, authProvider, Boolean(verifiedPhone)]
     )
     auditAuthAsync("auth", "session_register_success", {
       ip,
@@ -330,6 +383,14 @@ async function handlePostSession(req, res) {
       firebaseUid: firebase.uid,
       emailHint: `${resolvedEmail.slice(0, 2)}…`,
     })
+    if (req.body?.marketingConsent === true) {
+      await setMarketingConsent(pool, rows[0].id, true, "signup").catch(error => console.error("signup_consent_failed", error))
+    }
+    if (emailConfig().enabled) {
+      welcomeNewAccount({ id: rows[0].id, name: rows[0].name, email: rows[0].email }).catch(error =>
+        console.error("welcome_email_enqueue_failed", error)
+      )
+    }
     // Runs for every signup, referral code or not: the device history it records
     // is what later referrals are scored against.
     applyReferralOnSignup({
@@ -401,6 +462,17 @@ async function handlePostSession(req, res) {
 }
 
 /**
+ * GET /api/auth/config
+ * Which registration steps apply, so the signup screens follow the server's flags.
+ *
+ * @type {import("express").RequestHandler}
+ */
+function handleAuthConfig(_req, res) {
+  res.set("Cache-Control", "public, max-age=60")
+  return res.json(publicAuthConfig())
+}
+
+/**
  * GET /api/auth/phone-exists
  * Used by signup UI; rate-limited to reduce phone enumeration.
  *
@@ -419,13 +491,74 @@ async function handlePhoneExists(req, res) {
  * *after* the account exists, which is the point where the old flow dead-ended.
  * Shares the phone-enumeration limiter's shape for the same reason.
  *
+ * With email registration on this answers nothing: the register endpoint handles duplicates by
+ * mail, and a yes/no here would give away what that flow keeps private.
+ *
  * @type {import("express").RequestHandler}
  */
 async function handleEmailExists(req, res) {
+  if (emailConfig().verificationEnabled) return res.json({ exists: false })
   const email = normalizeEmailForLookup(req.query.email)
   if (!email || !email.includes("@")) return res.json({ exists: false })
   const { rows } = await pool.query("SELECT 1 FROM users WHERE lower(btrim(email)) = $1 LIMIT 1", [email])
   return res.json({ exists: rows.length > 0 })
+}
+
+/**
+ * POST /api/auth/register
+ * Email registration. Always the same answer for a new or known address (see auth/email-accounts.js).
+ *
+ * @type {import("express").RequestHandler}
+ */
+async function handleRegister(req, res) {
+  if (!emailConfig().verificationEnabled) return res.status(404).json({ error: "Not found" })
+  const { name, email, password, phone, gender, marketingConsent, referralCode } = req.body ?? {}
+  const deviceId = typeof req.headers["x-device-id"] === "string" ? req.headers["x-device-id"] : ""
+  await registerCustomer({ name, email, password, phone, gender, marketingConsent, referralCode, deviceId, ip: getClientIp(req) })
+  return res.status(202).json({ ok: true, message: "Check your inbox to confirm your email." })
+}
+
+/**
+ * POST /api/auth/verify-email
+ * Takes the token in the body, so it stays out of access logs. A POST also means a mail scanner
+ * fetching the link activates nothing; the customer presses the button on the page it opens.
+ *
+ * @type {import("express").RequestHandler}
+ */
+async function handleVerifyEmail(req, res) {
+  const status = await verifyEmailToken({ token: req.body?.token, ip: getClientIp(req) })
+  return res.status(status === "VERIFIED" || status === "ALREADY_VERIFIED" ? 200 : 400).json({ status })
+}
+
+/**
+ * POST /api/auth/resend-verification
+ *
+ * @type {import("express").RequestHandler}
+ */
+async function handleResendVerification(req, res) {
+  await resendVerification({ email: req.body?.email, ip: getClientIp(req) })
+  return res.status(202).json({ ok: true, message: "If that address is waiting to be confirmed, a new link is on its way." })
+}
+
+/**
+ * POST /api/auth/password-reset/validate
+ *
+ * @type {import("express").RequestHandler}
+ */
+async function handleValidatePasswordReset(req, res) {
+  return res.json(await checkPasswordResetToken(req.body?.token))
+}
+
+/**
+ * POST /api/auth/password-reset/complete
+ *
+ * @type {import("express").RequestHandler}
+ */
+async function handleCompletePasswordReset(req, res) {
+  const ip = getClientIp(req)
+  const { email } = await completePasswordReset({ token: req.body?.token, newPassword: req.body?.newPassword, ip })
+  clearPasswordLoginFailures(ip, normalizeEmailForLookup(email))
+  return res.json({ success: true })
 }
 
 /**
@@ -457,7 +590,7 @@ async function handleAppLogin(req, res) {
   }
   const { rows } = await pool.query(
     `
-      SELECT ${USER_PROFILE_COLUMNS}, password_hash
+      SELECT ${USER_PROFILE_COLUMNS}, password_hash, pending_email_signup_at
       FROM users
       WHERE lower(btrim(email)) = $1
       LIMIT 1
@@ -466,13 +599,29 @@ async function handleAppLogin(req, res) {
   )
   const user = rows[0]
   if (!user) {
+    // Same work as a wrong password, so response time does not reveal which addresses exist.
+    await bcrypt.compare(`${password ?? ""}`, await unknownUserHash())
     recordPasswordLoginFailure(ip, normalizedEmail)
     auditAuthAsync("auth", "login_failure", { ip, reason: "unknown_user", emailHint: `${normalizedEmail.slice(0, 2)}…` })
     return res.status(401).json({ error: "Invalid credentials" })
   }
+  if (user.pending_email_signup_at) {
+    // Only someone holding the right password learns the account is unconfirmed; to anyone else
+    // this looks like any other wrong password.
+    if (!(await bcrypt.compare(`${password ?? ""}`, user.password_hash ?? ""))) {
+      recordPasswordLoginFailure(ip, normalizedEmail)
+      auditAuthAsync("auth", "login_failure", { ip, reason: "bad_password", userId: user.id })
+      return res.status(401).json({ error: "Invalid credentials" })
+    }
+    auditAuthAsync("auth", "login_failure", { ip, reason: "email_not_verified", userId: user.id })
+    return res.status(403).json({ error: "EMAIL_NOT_VERIFIED" })
+  }
   if (user.account_status !== "ACTIVE") {
     auditAuthAsync("auth", "login_failure", { ip, reason: "account_not_active", userId: user.id })
-    return res.status(401).json({ error: "VERIFY_PHONE_FIRST" })
+    // A walk-in created at reception used to finish activation through phone OTP. With phone
+    // verification off, the emailed reset link is how they set a first password.
+    const noPhoneRoute = !emailConfig().phoneVerificationEnabled && user.role === "USER" && !user.password_hash
+    return res.status(401).json({ error: noPhoneRoute ? "SET_PASSWORD_REQUIRED" : "VERIFY_PHONE_FIRST" })
   }
   if (!user.password_hash) {
     // No app password can mean two different things, and answering with the wrong
@@ -747,8 +896,10 @@ async function handleStaffVerifyFirebasePhone(req, res) {
 
 /**
  * POST /api/auth/request-password-reset
- * Server-side trigger for Firebase reset email so rate limits and audits apply.
- * Returns 502 when Firebase refuses to send (wrong Action URL / continueUrl domain, API key, etc.) so the client can retry or show the error.
+ * Sends a reset link through SES when email registration is on, with one answer whether or not
+ * the address exists. Otherwise the server-side trigger for Firebase's reset email, so rate
+ * limits and audits apply; that path returns 502 when Firebase refuses to send (wrong Action URL
+ * / continueUrl domain, API key, etc.) so the client can retry or show the error.
  *
  * @type {import("express").RequestHandler}
  */
@@ -758,6 +909,11 @@ async function handleRequestPasswordReset(req, res) {
   const normalized = normalizeEmailForLookup(email)
   if (!normalized || !normalized.includes("@")) {
     return res.status(400).json({ error: "Valid email is required" })
+  }
+  if (emailConfig().verificationEnabled) {
+    await requestPasswordReset({ email: normalized })
+    auditAuthAsync("auth", "password_reset_requested", { ip, emailHint: `${normalized.slice(0, 2)}…` })
+    return res.json({ ok: true, message: "If an account exists for this email, a reset link was sent." })
   }
   const url = typeof continueUrl === "string" && continueUrl.startsWith("http") ? continueUrl : undefined
   try {
@@ -887,13 +1043,20 @@ function handleUsersMePlaceholder(req, res) {
 router.use(async (_req, _res, next) => {
   try {
     await ensureUserProfileSchema()
+    await ensureEmailSchema()
     next()
   } catch (error) {
     next(error)
   }
 })
 
+router.get("/config", handleAuthConfig)
 router.post("/session", sessionSyncRateLimit, requireFreshFirebaseToken, handlePostSession)
+router.post("/register", registerRateLimit, handleRegister)
+router.post("/verify-email", emailTokenRateLimit, handleVerifyEmail)
+router.post("/resend-verification", resendVerificationRateLimit, handleResendVerification)
+router.post("/password-reset/validate", emailTokenRateLimit, handleValidatePasswordReset)
+router.post("/password-reset/complete", passwordResetCompleteRateLimit, handleCompletePasswordReset)
 router.get("/phone-exists", phoneExistsRateLimit, handlePhoneExists)
 router.get("/email-exists", emailExistsRateLimit, handleEmailExists)
 router.post("/login", loginRateLimit, handleAppLogin)

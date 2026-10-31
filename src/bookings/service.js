@@ -21,6 +21,7 @@ import {
   queueBookingReminders,
   rescheduleBookingReminders,
 } from "../sms/reminders.js"
+import { cancelBookingEmails, prepareBookingEmails, queueBookingEmails, rescheduleBookingEmails } from "../email/booking-emails.js"
 import {
   attachRewardVoucherToBooking,
   claimRewardVoucher,
@@ -359,6 +360,7 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
   }
   const bookingId = uuid()
   await prepareSmsReminders()
+  await prepareBookingEmails()
   // Availability re-check, booking and payment in one transaction, serialised per
   // stylist (see createCustomerBooking for why).
   const { booking, paymentId } = await withTransaction(async client => {
@@ -407,8 +409,9 @@ export async function createReceptionBooking({ payload, actorUserId, publishEven
       })
       insertedPaymentId = inserted?.id ?? null
     }
-    // SMS reminders: rows in this transaction, sent at their scheduled time.
+    // SMS reminders and emails: rows in this transaction, sent at their scheduled time.
     await queueBookingReminders(client, created)
+    await queueBookingEmails(client, created)
     return { booking: created, paymentId: insertedPaymentId }
   })
   if (paymentId) {
@@ -950,8 +953,9 @@ async function runCustomerBookingTransaction(client, ctx, { payload, actorUser, 
     })
     paymentId = inserted?.id ?? null
   }
-  // SMS reminders, committed (or rolled back) with the booking itself.
+  // SMS reminders and emails, committed (or rolled back) with the booking itself.
   await queueBookingReminders(client, booking)
+  await queueBookingEmails(client, booking)
   return { booking, paymentId, payableAmount, walletRedeemAmount, firstBookingDiscountAmount, voucherDiscountAmount }
 }
 
@@ -1000,6 +1004,7 @@ export async function runPostBookingEffects({ created, actorUser, stylistId, pub
 export async function createCustomerBooking({ payload, actorUser, publishEvent, publishPaymentEvent }) {
   const ctx = await buildCustomerBookingContext({ payload, actorUser })
   await prepareSmsReminders()
+  await prepareBookingEmails()
   // Everything that must be true together happens in ONE transaction, serialised per
   // stylist: re-checking availability, consuming the voucher and wallet credit, writing
   // the booking and its payment. Checking availability outside and inserting afterwards
@@ -1237,6 +1242,7 @@ async function rescheduleBooking({ bookingId, payload, actorUserId }) {
   if (!requestedStart && !requestedStylistId) throw fail("Provide a new time and/or a stylist")
 
   await prepareSmsReminders()
+  await prepareBookingEmails()
   const result = await withTransaction(async client => {
     const locked = await getBookingForUpdate(client, bookingId)
     if (!locked) throw fail("Booking not found", "NOT_FOUND")
@@ -1291,6 +1297,10 @@ async function rescheduleBooking({ bookingId, payload, actorUserId }) {
     if (new Date(current.startsAt).getTime() !== new Date(updated.startsAt).getTime()) {
       // Replaces the old SMS reminders, only if this move commits.
       await rescheduleBookingReminders(client, updated)
+    }
+    const timeChanged = new Date(current.startsAt).getTime() !== new Date(updated.startsAt).getTime()
+    if (timeChanged || current.stylistId !== updated.stylistId) {
+      await rescheduleBookingEmails(client, updated, { previousStartsAt: current.startsAt, timeChanged })
     }
     return { updated, previousStylistId: current.stylistId, previousStart: current.startsAt }
   })
@@ -1451,6 +1461,7 @@ export async function getCustomerCancellationPreview({ bookingId, actorUser }) {
 async function cancelBookingWithRefund({ bookingId, actorUserId, authorize, auditAction = null, refundPercentOverride = null }) {
   if (isRazorpayConfigured()) await ensurePaymentsSchema()
   await prepareSmsReminders()
+  await prepareBookingEmails()
   const result = await withTransaction(async client => {
     const locked = await getBookingForUpdate(client, bookingId)
     if (!locked) throw Object.assign(new Error("Booking not found"), { code: "NOT_FOUND" })
@@ -1499,6 +1510,7 @@ async function cancelBookingWithRefund({ bookingId, actorUserId, authorize, audi
     if (!updated) throw Object.assign(new Error("This booking cannot be cancelled"), { code: "INVALID_TRANSITION" })
     // Drops pending SMS reminders, only if this commits.
     await cancelBookingReminders(client, bookingId)
+    await cancelBookingEmails(client, booking, refundPreview)
     if (auditAction) {
       await insertAuditLog(client, {
         action: auditAction,

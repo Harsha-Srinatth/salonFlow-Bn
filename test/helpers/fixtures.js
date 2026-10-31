@@ -5,6 +5,8 @@ import { ensureBookingsSchema } from "../../src/bookings/schema-init.js"
 import { createBooking } from "../../src/bookings/repository.js"
 import { ensureOfferSchema } from "../../src/offers/service.js"
 import { ensureSmsSchema, prepareSmsReminders } from "../../src/sms/reminders.js"
+import { ensureEmailSchema } from "../../src/email/schema.js"
+import { prepareBookingEmails } from "../../src/email/booking-emails.js"
 
 export { pool }
 
@@ -14,11 +16,13 @@ export async function prepareDatabase() {
   await ensureOfferSchema()
   await ensureSmsSchema()
   await prepareSmsReminders()
+  await ensureEmailSchema()
+  await prepareBookingEmails()
 }
 
 export async function resetData() {
   await pool.query(`
-    TRUNCATE sms_messages, offer_global_discounts, offer_service_discounts, offer_membership_service_discounts, offer_combos
+    TRUNCATE sms_messages, email_messages, email_tokens, email_suppressions, email_events, email_campaigns, offer_global_discounts, offer_service_discounts, offer_membership_service_discounts, offer_combos
     CASCADE
   `)
   await pool.query(`DELETE FROM bookings`)
