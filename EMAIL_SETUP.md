@@ -2,8 +2,8 @@
 
 Customers register and recover their password by email, and get booking confirmations, reminders,
 cancellations and rescheduling notices. Promotions go only to customers who opted in. Everything is
-sent through **Amazon SES** in `ap-southeast-2`, from `support@sahasrafamilysalon.in`, with replies
-going to `team@sahasrafamilysalon.in`.
+sent through **Amazon SES** in `ap-southeast-2`, from `team@sahasrafamilysalon.in`, and replies
+come back to that same mailbox.
 
 ## How it works
 
